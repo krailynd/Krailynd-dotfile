@@ -1,17 +1,18 @@
 # ~/.zshrc — example (sanitized). Copy to ~/.zshrc and fill YOUR_*_KEY.
 # Requires: oh-my-zsh, powerlevel10k, atuin, zoxide, eza, batcat, duf, fzf
+# Placeholders: YOUR_NVIDIA_API_KEY (nvapi-*), YOUR_OMNIROUTE_API_KEY (sk-*)
 
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.opencode/bin:$PATH"
 export EDITOR="nano"
 
-# --- API keys (REPLACE placeholders, never commit real values) ---
-export NVIDIA_API_KEY="YOUR_NVIDIA_API_KEY"   # nvapi-* from https://build.nvidia.com
-export OPENAI_API_KEY="$NVIDIA_API_KEY"       # or YOUR_OPENAI_API_KEY (sk-...)
+# NVIDIA NIM via OpenAI-compatible endpoint
+export NVIDIA_API_KEY="YOUR_NVIDIA_API_KEY"
+export OPENAI_API_KEY="$NVIDIA_API_KEY"
 export OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
+# NIM no tiene gpt-4.1-mini (default de graphify) → definir modelo válido para graphify
 export GRAPHIFY_OPENAI_MODEL="mistralai/mistral-medium-3.5-128b"
-export OMNIROUTE_API_KEY="YOUR_OMNIROUTE_API_KEY"  # sk-* for OmniRoute/OpenRouter proxy
 
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
@@ -27,10 +28,12 @@ plugins=(
 
 source $ZSH/oh-my-zsh.sh
 
+# zoxide
 if command -v zoxide >/dev/null 2>&1; then
   eval "$(zoxide init zsh)"
 fi
 
+# atuin
 export ATUIN_NOBIND=true
 if [ -f "$HOME/.atuin/bin/env" ]; then
   source "$HOME/.atuin/bin/env"
@@ -44,6 +47,7 @@ if command -v atuin >/dev/null 2>&1; then
   bindkey '^[OB' down-line-or-search
 fi
 
+# aliases
 alias ls='eza --icons --color=always --group-directories-first'
 alias ll='eza -la --icons --color=always --group-directories-first'
 alias la='eza -a --icons --color=always --group-directories-first'
@@ -54,6 +58,7 @@ alias top='btop'
 alias oc='opencode'
 alias reload='exec zsh'
 
+# history
 HISTSIZE=50000
 SAVEHIST=50000
 setopt HIST_IGNORE_DUPS
@@ -73,6 +78,10 @@ status() {
 
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
 
+# OmniRoute API key (used by opencode / other OpenAI-compatible CLIs)
+export OMNIROUTE_API_KEY="YOUR_OMNIROUTE_API_KEY-86c5a6-4db0aea8"
+
+
 __wezterm_status() {
   printf '\e]7;file://%s%s\e\\' "$HOST" "$PWD"
   local branch=""
@@ -85,24 +94,48 @@ __wezterm_status() {
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd __wezterm_status
 
+# ---------------------------------------------------------------------------
+# CLI-taYOUR_OMNIROUTE_API_KEY notification (Claude Code, opencode, aider, etc.)
+# Rings the terminal bell + posts a tmux message when a matched AI/dev CLI
+# returns to the prompt, or any command runs longer than 8s. tmux is set to
+# highlight that window's tab on a bell (see ~/.tmux.conf), so from any other
+# tmux window you can see at a glance which one just finished.
+# NOTE: this can only fire when the whole foreground program exits back to
+# the shell prompt — it can't see "turns" inside a still-running REPL like
+# claude/opencode. If those tools ring the terminal bell themselves after
+# each response (many do, precisely for this use case), tmux's bell
+# monitoring below already catches that on its own, no hook needed for it.
+# ---------------------------------------------------------------------------
 zmodload zsh/datetime
 typeset -ga NOTIFY_CLI_CMDS=(claude opencode aider cursor cline code ollama oc)
 typeset -g __notify_cmd=""
 typeset -g __notify_start=0
-__notify_preexec() { __notify_cmd="${1%% *}"; __notify_start=$EPOCHSECONDS; }
+
+__notify_preexec() {
+  __notify_cmd="${1%% *}"
+  __notify_start=$EPOCHSECONDS
+}
+
 __notify_precmd() {
-  local elapsed=$(( EPOCHSSECONDS - __notify_start ))
+  local elapsed=$(( EPOCHSECONDS - __notify_start ))
   if [ -n "$__notify_cmd" ]; then
     local base="${__notify_cmd##*/}"
     if (( elapsed >= 8 )) || (( ${NOTIFY_CLI_CMDS[(Ie)$base]} )); then
       printf '\a'
-      [ -n "$TMUX" ] && tmux display-message -d 2000 "✓ ${base} finished (${elapsed}s)" 2>/dev/null
+      if [ -n "$TMUX" ]; then
+        tmux display-message -d 2000 "✓ ${base} finished (${elapsed}s)" 2>/dev/null
+      fi
     fi
   fi
-  __notify_cmd=""; __notify_start=0
+  __notify_cmd=""
+  __notify_start=0
 }
 add-zsh-hook preexec __notify_preexec
 add-zsh-hook precmd __notify_precmd
 
-export PATH="$HOME/.local/bin:$PATH"
-export PATH="$HOME/.kimi-code/bin:$PATH"
+
+# Added by Antigravity CLI installer
+export PATH="/home/sahacloud/.local/bin:$PATH"
+
+# kimi-code
+export PATH="/home/sahacloud/.kimi-code/bin:$PATH"

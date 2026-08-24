@@ -99,10 +99,10 @@ install_archlinux_krai() {
   [ -f "$HOME/.tmux-target-prompt.sh" ] && chmod +x "$HOME/.tmux-target-prompt.sh"
 
   echo ""
-  echo "==> config/ (alacritty, atuin, btop, gh, herdr, lazygit, gga, ssh)"
+  echo "==> config/ (alacritty, atuin, btop, gh, herdr, lazygit, gga, ssh, wezterm)"
   mkdir -p "$HOME/.config/alacritty" "$HOME/.config/atuin" "$HOME/.config/btop" \
            "$HOME/.config/gh" "$HOME/.config/herdr" "$HOME/.config/lazygit" \
-           "$HOME/.config/gga" "$HOME/.ssh"
+           "$HOME/.config/gga" "$HOME/.ssh" "$HOME/.config/wezterm"
   install_example "$SRC/config/alacritty/alacritty.toml" "$HOME/.config/alacritty/alacritty.toml"
   install_example "$SRC/config/atuin/config.toml" "$HOME/.config/atuin/config.toml"
   install_example "$SRC/config/btop/btop.conf" "$HOME/.config/btop/btop.conf"
@@ -113,6 +113,7 @@ install_archlinux_krai() {
   install_example "$SRC/config/gga/config" "$HOME/.config/gga/config"
   install_example "$SRC/config/gga/AGENTS.md" "$HOME/.config/gga/AGENTS.md"
   install_example "$SRC/config/ssh/config.example" "$HOME/.ssh/config"
+  install_example "$SRC/config/wezterm/wezterm.lua" "$HOME/.config/wezterm/wezterm.lua"
 
   echo ""
   echo "==> config/opencode/ (config, skills, prompts, commands, plugins)"

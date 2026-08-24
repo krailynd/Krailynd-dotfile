@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Bridge de Hermes hacia la extension de Firefox/Zen.
+
+Hermes corre en la VM Ubuntu; Zen Browser, en el PC Windows. El host nativo hace
+long-poll contra este servidor, recoge comandos y devuelve resultados. Todas
+las conexiones las inicia Windows: no hace falta abrir puertos en el PC ni que
+el servidor sepa alcanzarlo.
+
+    hermes  --POST /command-->  BRIDGE  <--GET /pull--   host nativo Firefox (Windows)
+            <--respuesta------          <--POST /result--
+                                        <--POST /blob----
+
+Endpoints
+    POST /command   {cmd, params, timeout}  -> encola y espera el resultado
+    GET  /pull                              -> long-poll de comandos pendientes
+    POST /result    {id, ok, ...}           -> el host entrega un resultado
+    POST /blob      {ref, meta, base64}     -> imagen reensamblada; se guarda a disco
+    POST /event     {evento, datos}         -> evento espontaneo del navegador
+    POST /hello                             -> la extension se ha conectado
+    GET  /status                            -> salud del puente
+    GET  /events                            -> ultimos eventos
+    GET  /blob/<ref>                        -> metadatos y ruta de una captura
+
+Las capturas NO viajan dentro de la respuesta del comando: se guardan en disco
+y el resultado solo lleva la ruta. Un PNG en base64 dentro del contexto de un
+modelo cuesta decenas de miles de tokens y casi nunca hace falta mirarlo.
+
+Auth: cabecera X-Hermes-Token, comparada en tiempo constante.
+"""
+import base64
+import binascii
+import json
+import os
+import queue
+import re
+import secrets
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+PROTOCOLO = "2.0.0"
+
+HOST = os.environ.get("HERMES_ZEN_HOST", "0.0.0.0")
+# 8771 y no 8770: asi la variante Zen convive con la de Vivaldi sin
+# pisarla. Cada una tiene su bridge, su token y su carpeta de capturas.
+PORT = int(os.environ.get("HERMES_ZEN_PORT", "8771"))
+
+BASE = Path.home() / ".hermes" / "zen"
+TOKEN_FILE = Path.home() / ".hermes" / "zen-bridge.token"
+SHOTS = BASE / "shots"
+
+PULL_TIMEOUT = 30          # long-poll; el host reintenta al vencer
+CMD_TIMEOUT = 90           # espera maxima por el resultado de un comando
+MAX_SHOTS = 300            # capturas conservadas en disco
+
+cola: "queue.Queue[dict]" = queue.Queue()
+esperando: "dict[str, threading.Event]" = {}
+resultados: "dict[str, dict]" = {}
+eventos: "list[dict]" = []
+bandeja: "list[dict]" = []          # instrucciones escritas en el sidebar
+blobs: "dict[str, dict]" = {}          # ref -> {"path","meta","ts","bytes"}
+lock = threading.Lock()
+estado = {"ultimo_pull": 0.0, "ultimo_hello": 0.0, "version_extension": None}
+
+REF_VALIDA = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+
+
+def token() -> str:
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+    t = secrets.token_hex(24)
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(t, encoding="utf-8")
+    TOKEN_FILE.chmod(0o600)
+    return t
+
+
+TOKEN = token()
+
+
+def purgar_capturas() -> None:
+    """Deja como mucho MAX_SHOTS capturas. Una sesion larga con captura
+    automatica genera cientos de ficheros y nadie los borra nunca."""
+    try:
+        ficheros = sorted(SHOTS.glob("*.*"), key=lambda p: p.stat().st_mtime)
+        for p in ficheros[:-MAX_SHOTS]:
+            p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_a):
+        pass  # systemd ya registra; el log por defecto es ruido
+
+    # ---------------------------------------------------------- utilidades
+    def autorizado(self) -> bool:
+        return secrets.compare_digest(self.headers.get("X-Hermes-Token", ""), TOKEN)
+
+    def responder(self, codigo: int, obj) -> None:
+        cuerpo = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(codigo)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
+
+    def cuerpo(self) -> dict:
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        return json.loads(self.rfile.read(n).decode("utf-8", "replace"))
+
+    # ----------------------------------------------------------------- GET
+    def do_GET(self):
+        if self.path == "/status":
+            with lock:
+                ahora = time.time()
+                viva = (ahora - estado["ultimo_pull"]) < 60
+                self.responder(200, {
+                    "bridge": "ok",
+                    "protocolo": PROTOCOLO,
+                    "extension_conectada": viva,
+                    "version_extension": estado["version_extension"],
+                    "ultimo_pull_hace_s": round(ahora - estado["ultimo_pull"], 1)
+                                          if estado["ultimo_pull"] else None,
+                    "comandos_en_cola": cola.qsize(),
+                    "eventos": len(eventos),
+                    "capturas": len(blobs),
+                    "instrucciones_pendientes": len(bandeja),
+                    "directorio_capturas": str(SHOTS),
+                })
+            return
+
+        if not self.autorizado():
+            self.responder(401, {"error": "token invalido"})
+            return
+
+        if self.path == "/inbox":
+            # Instrucciones que el usuario escribio en el panel lateral. Se
+            # entregan UNA vez: Hermes las consume y desaparecen, para que dos
+            # sondeos seguidos no ejecuten la misma orden dos veces.
+            with lock:
+                pendientes = bandeja[:]
+                bandeja.clear()
+            self.responder(200, {"instrucciones": pendientes})
+            return
+
+        if self.path == "/events":
+            with lock:
+                self.responder(200, {"eventos": eventos[-50:]})
+            return
+
+        if self.path.startswith("/blob/"):
+            ref = self.path[len("/blob/"):]
+            with lock:
+                b = blobs.get(ref)
+            if not b:
+                self.responder(404, {"error": f"captura desconocida: {ref}"})
+            else:
+                self.responder(200, b)
+            return
+
+        if self.path == "/pull":
+            with lock:
+                estado["ultimo_pull"] = time.time()
+            lote = []
+            try:
+                lote.append(cola.get(timeout=PULL_TIMEOUT))
+                while True:                       # arrastra lo que ya este listo
+                    lote.append(cola.get_nowait())
+            except queue.Empty:
+                pass
+            self.responder(200, {"comandos": lote})
+            return
+
+        self.responder(404, {"error": "ruta desconocida"})
+
+    # ---------------------------------------------------------------- POST
+    def do_POST(self):
+        if not self.autorizado():
+            self.responder(401, {"error": "token invalido"})
+            return
+
+        try:
+            datos = self.cuerpo()
+        except Exception as e:
+            self.responder(400, {"error": f"json invalido: {e}"})
+            return
+
+        if self.path == "/command":
+            self._command(datos)
+        elif self.path == "/result":
+            self._result(datos)
+        elif self.path == "/blob":
+            self._blob(datos)
+        elif self.path == "/event":
+            self._event(datos)
+        elif self.path == "/hello":
+            self._hello(datos)
+        else:
+            self.responder(404, {"error": "ruta desconocida"})
+
+    # ------------------------------------------------------------ handlers
+    def _command(self, datos: dict) -> None:
+        cmd = datos.get("cmd")
+        if not cmd:
+            self.responder(400, {"error": "falta cmd"})
+            return
+
+        with lock:
+            viva = (time.time() - estado["ultimo_pull"]) < 60
+        if not viva:
+            self.responder(503, {
+                "ok": False,
+                "error": {
+                    "code": "E_SIN_EXTENSION",
+                    "message": "la extension no esta conectada al bridge",
+                    "detail": "abre Vivaldi, comprueba que la extension este activa y mira /status",
+                },
+            })
+            return
+
+        cid = uuid.uuid4().hex[:12]
+        ev = threading.Event()
+        with lock:
+            esperando[cid] = ev
+
+        cola.put({
+            "v": PROTOCOLO,
+            "id": cid,
+            "cmd": cmd,
+            "params": datos.get("params") or {},
+            "timeoutMs": datos.get("timeoutMs"),
+        })
+
+        espera = datos.get("timeout") or CMD_TIMEOUT
+        if not ev.wait(espera):
+            with lock:
+                esperando.pop(cid, None)
+            self.responder(504, {
+                "ok": False,
+                "error": {
+                    "code": "E_TIMEOUT_BRIDGE",
+                    "message": f"la extension no respondio en {espera}s",
+                    "detail": "comprueba /status y el log del host nativo",
+                },
+            })
+            return
+
+        with lock:
+            r = resultados.pop(cid, {})
+            esperando.pop(cid, None)
+
+        self.responder(200, self._enriquecer(r))
+
+    def _enriquecer(self, r: dict) -> dict:
+        """Sustituye la referencia de captura por su ruta en disco, que es lo
+        unico que Hermes puede usar directamente."""
+        ev = r.get("evidence") or {}
+        ref = ev.get("screenshot")
+        if ref:
+            with lock:
+                b = blobs.get(ref)
+            if b:
+                ev["screenshot"] = {"ref": ref, "path": b["path"],
+                                    "ancho": b["meta"].get("ancho"),
+                                    "alto": b["meta"].get("alto")}
+            else:
+                # El blob no llego (extension reciclada a mitad de envio).
+                # Mejor decirlo que dejar una referencia que no resuelve.
+                ev["screenshot"] = {"ref": ref, "path": None, "error": "captura no recibida"}
+            r["evidence"] = ev
+        return r
+
+    def _result(self, datos: dict) -> None:
+        cid = datos.get("id")
+        if not cid:
+            self.responder(400, {"error": "falta id"})
+            return
+        with lock:
+            resultados[cid] = datos
+            ev = esperando.get(cid)
+        if ev:
+            ev.set()
+        else:
+            # Llego tarde: el cliente ya se rindio. Lo registramos para poder
+            # distinguir "la extension esta muerta" de "la extension es lenta".
+            with lock:
+                eventos.append({"ts": time.time(), "evento": "resultado_tardio", "datos": {"id": cid}})
+                del eventos[:-200]
+        self.responder(200, {"ok": True})
+
+    def _blob(self, datos: dict) -> None:
+        ref = datos.get("ref") or ""
+        if not REF_VALIDA.match(ref):
+            self.responder(400, {"error": "ref invalida"})
+            return
+
+        meta = datos.get("meta") or {}
+        try:
+            crudo = base64.b64decode(datos.get("base64") or "", validate=True)
+        except (binascii.Error, ValueError) as e:
+            self.responder(400, {"error": f"base64 invalido: {e}"})
+            return
+
+        ext = "jpg" if str(meta.get("formato")) == "jpeg" else "png"
+        etiqueta = re.sub(r"[^\w.-]+", "_", str(meta.get("etiqueta") or "captura"))[:40]
+        destino = SHOTS / f"{time.strftime('%Y%m%d-%H%M%S')}-{etiqueta}-{ref}.{ext}"
+
+        SHOTS.mkdir(parents=True, exist_ok=True)
+        destino.write_bytes(crudo)
+        purgar_capturas()
+
+        with lock:
+            blobs[ref] = {"path": str(destino), "meta": meta, "ts": time.time(), "bytes": len(crudo)}
+            # Mismo tope en memoria que en disco.
+            if len(blobs) > MAX_SHOTS:
+                for viejo in sorted(blobs, key=lambda k: blobs[k]["ts"])[:len(blobs) - MAX_SHOTS]:
+                    blobs.pop(viejo, None)
+
+        self.responder(200, {"ok": True, "path": str(destino), "bytes": len(crudo)})
+
+    def _event(self, datos: dict) -> None:
+        # Las instrucciones del sidebar llegan como un evento mas, pero van a
+        # su propia cola: los eventos son un log que se relee, y una orden del
+        # usuario tiene que consumirse exactamente una vez.
+        if datos.get("evento") == "instruccion":
+            texto = (datos.get("datos") or {}).get("texto")
+            if texto:
+                with lock:
+                    bandeja.append({"ts": time.time(), "texto": str(texto)[:4000]})
+                    del bandeja[:-50]
+        with lock:
+            eventos.append({"ts": time.time(), **datos})
+            del eventos[:-200]
+        self.responder(200, {"ok": True})
+
+    def _hello(self, datos: dict) -> None:
+        with lock:
+            estado["ultimo_hello"] = time.time()
+            estado["version_extension"] = (datos.get("datos") or {}).get("version")
+        self.responder(200, {"ok": True, "protocolo": PROTOCOLO})
+
+
+def main() -> int:
+    SHOTS.mkdir(parents=True, exist_ok=True)
+    print(f"bridge v{PROTOCOLO} escuchando en {HOST}:{PORT}", file=sys.stderr)
+    print(f"token en {TOKEN_FILE}", file=sys.stderr)
+    print(f"capturas en {SHOTS}", file=sys.stderr)
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

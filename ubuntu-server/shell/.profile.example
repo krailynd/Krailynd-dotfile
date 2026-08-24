@@ -1,0 +1,9 @@
+# ~/.profile — example (sanitized)
+if [ -n "$BASH_VERSION" ]; then
+  if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+fi
+if [ -d "$HOME/bin" ] ; then PATH="$HOME/bin:$PATH"; fi
+if [ -d "$HOME/.local/bin" ] ; then PATH="$HOME/.local/bin:$PATH"; fi
+. "$HOME/.atuin/bin/env" 2>/dev/null || true
+# cargo removed (2026-08-06) — no longer sourced
+export PATH="$HOME/.local/bin:$PATH"

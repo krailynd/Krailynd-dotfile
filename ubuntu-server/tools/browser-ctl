@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+"""browser_controller - capa unica de control del navegador para Hermes.
+
+POR QUE EXISTE
+--------------
+Hermes usa varios modelos: baratos para mirar y comprobar, fuertes para
+planificar. Si cada uno hablase con la extension a su manera, cambiar de modelo
+rompería la navegacion y habria que mantener N integraciones. Aqui hay UNA sola
+superficie: todos los modelos ejecutan este mismo CLI con los mismos
+subcomandos y reciben la misma salida. El modelo decide QUE hacer; este modulo
+decide COMO hablarlo con el navegador.
+
+DISENO PARA POCOS TOKENS
+------------------------
+La salida por defecto es texto compacto pensado para leerse dentro del contexto
+de un modelo, no JSON crudo. `look` resume una pagina entera en unas pocas
+lineas con referencias estables ([e12]) que luego se usan para actuar. Con
+--json se obtiene la respuesta completa cuando de verdad hace falta.
+
+USO
+    browser-ctl status
+    browser-ctl open https://ejemplo.com
+    browser-ctl look
+    browser-ctl click --ref e12
+    browser-ctl type --ref e5 --text "hola" --enter
+    browser-ctl shot --label paso3
+    browser-ctl raw page_html --json-params '{"max": 5000}'
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# El modulo de vision se instala junto a este fichero. Se importa de forma
+# tolerante: sin backend de vision el resto del CLI debe seguir funcionando
+# entero, porque analizar capturas es una capacidad opcional.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import hermes_vision  # type: ignore
+except ImportError:  # pragma: no cover
+    try:
+        import vision as hermes_vision  # type: ignore
+    except ImportError:
+        hermes_vision = None  # type: ignore
+
+PROTOCOLO = "2.0.0"
+
+BRIDGE = os.environ.get("HERMES_BRIDGE_URL", "http://127.0.0.1:8770").rstrip("/")
+TOKEN_FILE = Path.home() / ".hermes" / "vivaldi-bridge.token"
+ESTADO = Path.home() / ".hermes" / "vivaldi" / "adapter-state.json"
+
+# Reintentar solo tiene sentido en fallos transitorios. Reintentar un
+# E_BAD_PARAMS es garantia de fallar tres veces en vez de una.
+REINTENTABLES = {
+    "E_SELECTOR_NOT_FOUND",
+    "E_TIMEOUT",
+    "E_CONTENT_UNREACHABLE",
+    "E_TAB_GONE",
+}
+
+MAX_REINTENTOS = 2
+ESPERA_REINTENTO = 1.2
+
+# Cortafuegos contra modelos que se atascan repitiendo la misma accion.
+MAX_FALLOS_IGUALES = 3     # mismos parametros fallando una y otra vez
+MAX_REPETICIONES = 10      # tope duro aunque todo devuelva ok
+
+# Se deriva del modulo de vision en vez de repetirla aqui: una lista duplicada
+# se desincroniza en cuanto se anade un backend, y el sintoma es un
+# "invalid choice" que no explica nada.
+PROVEEDORES_VISION = sorted(hermes_vision.CLAVE_ENV) if hermes_vision else []
+
+
+class ErrorControlador(Exception):
+    def __init__(self, code: str, message: str, detail=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.detail = detail
+
+
+# --------------------------------------------------------------- transporte
+
+def _token() -> str:
+    env = os.environ.get("HERMES_BRIDGE_TOKEN")
+    if env:
+        return env
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+    raise ErrorControlador(
+        "E_SIN_TOKEN",
+        f"no hay token: ni HERMES_BRIDGE_TOKEN ni {TOKEN_FILE}",
+        "arranca el bridge una vez para que lo genere",
+    )
+
+
+def _http(ruta: str, payload=None, timeout: float = 120):
+    url = f"{BRIDGE}{ruta}"
+    cabeceras = {"Content-Type": "application/json", "X-Hermes-Token": _token()}
+    datos = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=datos, headers=cabeceras,
+                                 method="POST" if datos is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            cuerpo = r.read().decode("utf-8", "replace")
+            return json.loads(cuerpo) if cuerpo else {}
+    except urllib.error.HTTPError as e:
+        cuerpo = e.read().decode("utf-8", "replace")
+        try:
+            return json.loads(cuerpo)
+        except Exception:
+            raise ErrorControlador("E_BRIDGE", f"HTTP {e.code}: {cuerpo[:300]}")
+    except urllib.error.URLError as e:
+        raise ErrorControlador(
+            "E_BRIDGE_CAIDO",
+            f"no se pudo contactar con el bridge en {BRIDGE}: {e.reason}",
+            "arranca el bridge: hermes-vivaldi-bridge",
+        )
+
+
+# --------------------------------------------------------- control de bucles
+
+def _estado_leer() -> dict:
+    try:
+        return json.loads(ESTADO.read_text(encoding="utf-8"))
+    except Exception:
+        return {"ultima": None, "repeticiones": 0}
+
+
+def _estado_escribir(d: dict) -> None:
+    try:
+        ESTADO.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO.write_text(json.dumps(d), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _vigilar_bucle(firma: str) -> None:
+    """Corta si el agente repite la misma accion y sigue fallando.
+
+    Ojo con el criterio: cuenta FALLOS consecutivos identicos, no repeticiones
+    a secas. El ciclo correcto (look -> actua -> look) repite `look` a
+    proposito, y una version anterior de esto lo tomaba por un bucle y
+    bloqueaba trabajo legitimo. Lo que de verdad hay que romper es al modelo
+    que reintenta el mismo selector roto indefinidamente."""
+    st = _estado_leer()
+    if st.get("ultima") != firma:
+        st = {"ultima": firma, "repeticiones": 1, "fallos": 0}
+    else:
+        st["repeticiones"] = int(st.get("repeticiones", 0)) + 1
+    _estado_escribir(st)
+
+    fallos = int(st.get("fallos", 0))
+    if fallos >= MAX_FALLOS_IGUALES:
+        _estado_escribir({"ultima": None, "repeticiones": 0, "fallos": 0})
+        raise ErrorControlador(
+            "E_BUCLE",
+            f"esta misma accion ya ha fallado {fallos} veces seguidas",
+            "cambia de estrategia: vuelve a leer la pagina con `look`, prueba otro "
+            "selector o admite que el paso no es posible",
+        )
+
+    # Tope duro contra el giro en vacio, aunque todo devuelva ok.
+    if int(st.get("repeticiones", 0)) > MAX_REPETICIONES:
+        _estado_escribir({"ultima": None, "repeticiones": 0, "fallos": 0})
+        raise ErrorControlador(
+            "E_BUCLE",
+            f"la misma accion se ha repetido {st['repeticiones']} veces sin cambiar de contexto",
+            "estas girando en vacio: replantea el plan o pregunta al usuario",
+        )
+
+
+def _anotar_resultado(firma: str, ok: bool) -> None:
+    """Registra como acabo el intento, para que el guardia de bucles distinga
+    'repite porque avanza' de 'repite porque esta atascado'."""
+    st = _estado_leer()
+    if st.get("ultima") != firma:
+        return
+    st["fallos"] = 0 if ok else int(st.get("fallos", 0)) + 1
+    _estado_escribir(st)
+
+
+# ------------------------------------------------------------------ llamada
+
+def llamar(cmd: str, params: dict | None = None, timeout: float = 120) -> dict:
+    """Ejecuta un comando con reintentos acotados. Devuelve el `result`."""
+    params = params or {}
+    firma = f"{cmd}:{json.dumps(params, sort_keys=True)}"
+    _vigilar_bucle(firma)
+
+    ultimo: ErrorControlador | None = None
+    for intento in range(MAX_REINTENTOS + 1):
+        r = _http("/command", {"cmd": cmd, "params": params, "timeout": timeout}, timeout + 15)
+
+        if r.get("ok"):
+            _anotar_resultado(firma, True)
+            if intento:
+                print(f"[reintento {intento} ok]", file=sys.stderr)
+            return r
+
+        err = r.get("error") or {"code": "E_DESCONOCIDO", "message": json.dumps(r)[:300]}
+        ultimo = ErrorControlador(err.get("code", "E_DESCONOCIDO"),
+                                  err.get("message", ""), err.get("detail"))
+
+        if ultimo.code not in REINTENTABLES or intento == MAX_REINTENTOS:
+            _anotar_resultado(firma, False)
+            raise ultimo
+
+        print(f"[{ultimo.code} - reintentando {intento + 1}/{MAX_REINTENTOS}]", file=sys.stderr)
+        time.sleep(ESPERA_REINTENTO * (intento + 1))
+
+    raise ultimo or ErrorControlador("E_INTERNO", "sin resultado")
+
+
+# ------------------------------------------------------------------ formato
+
+def _acortar(s: str, n: int) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def formatear_resumen(r: dict) -> str:
+    """Convierte page_summary en el formato compacto que consume el modelo."""
+    res = r.get("result", {})
+    lineas = [
+        f"URL    {res.get('url')}",
+        f"TITULO {res.get('titulo')}",
+    ]
+
+    if res.get("sinCambios"):
+        lineas.append("NOTA   la pagina no ha cambiado desde tu ultima lectura")
+
+    encabezados = res.get("encabezados") or []
+    if encabezados:
+        lineas.append("")
+        lineas.append("ENCABEZADOS")
+        for h in encabezados[:12]:
+            lineas.append(f"  {'#' * h.get('nivel', 1)} {_acortar(h.get('texto', ''), 90)}")
+
+    elementos = res.get("elementos") or []
+    if elementos:
+        lineas.append("")
+        lineas.append(f"INTERACTIVOS ({len(elementos)} de {res.get('elementosTotal')})")
+        for e in elementos:
+            partes = [f"  [{e['ref']}]", e.get("tag", "")]
+            if e.get("tipo"):
+                partes.append(f"({e['tipo']})")
+            if e.get("texto"):
+                partes.append(f'"{_acortar(e["texto"], 60)}"')
+            if e.get("placeholder"):
+                partes.append(f'ph="{_acortar(e["placeholder"], 40)}"')
+            if e.get("href"):
+                partes.append(f"-> {_acortar(e['href'], 60)}")
+            if e.get("deshabilitado"):
+                partes.append("[deshabilitado]")
+            lineas.append(" ".join(partes))
+        if res.get("elementosTruncados"):
+            lineas.append("  … hay mas; filtra con `elements --filtro <texto>`")
+
+    texto = res.get("texto")
+    if texto:
+        lineas.append("")
+        lineas.append("TEXTO")
+        lineas.append(_acortar(texto, 1500))
+
+    sc = res.get("scroll") or {}
+    if sc:
+        lineas.append("")
+        lineas.append(
+            f"SCROLL y={sc.get('y')} de {sc.get('alturaTotal')}"
+            + (" (fin de pagina)" if sc.get("finDePagina") else "")
+        )
+
+    return "\n".join(lineas)
+
+
+def formatear_evidencia(r: dict) -> str:
+    ev = r.get("evidence") or {}
+    trozos = []
+    if ev.get("url"):
+        trozos.append(f"url={ev['url']}")
+    shot = ev.get("screenshot")
+    if isinstance(shot, dict) and shot.get("path"):
+        trozos.append(f"captura={shot['path']}")
+    return "  ".join(trozos)
+
+
+def salida(r: dict, como_json: bool, resumen: str | None = None) -> None:
+    if como_json:
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+    if resumen is not None:
+        print(resumen)
+    else:
+        print(json.dumps(r.get("result"), ensure_ascii=False))
+    ev = formatear_evidencia(r)
+    if ev:
+        print(f"\n{ev}")
+
+
+# ------------------------------------------------------------ objetivo comun
+
+def objetivo(a: argparse.Namespace) -> dict:
+    """Traduce --ref/--selector/--texto al objetivo del protocolo."""
+    p: dict = {}
+    if getattr(a, "ref", None):
+        p["ref"] = a.ref
+    elif getattr(a, "selector", None):
+        p["selector"] = a.selector
+    elif getattr(a, "texto", None):
+        p["texto"] = a.texto
+    else:
+        raise ErrorControlador("E_BAD_PARAMS", "indica --ref, --selector o --texto")
+    if getattr(a, "nth", None):
+        p["nth"] = a.nth
+    return p
+
+
+def anadir_objetivo(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--ref", help="referencia estable devuelta por look/elements (p.ej. e12)")
+    sp.add_argument("--selector", help="selector CSS")
+    sp.add_argument("--texto", help="texto visible del elemento")
+    sp.add_argument("--nth", type=int, help="si el selector devuelve varios, cual (0-based)")
+
+
+# ---------------------------------------------------------------- subcomandos
+
+def cmd_status(a):
+    try:
+        est = _http("/status", timeout=10)
+    except ErrorControlador as e:
+        print(f"bridge: CAIDO ({e.message})")
+        return 2
+
+    conectada = est.get("extension_conectada")
+    print(f"bridge:    ok ({BRIDGE})")
+    print(f"extension: {'conectada' if conectada else 'NO conectada'}")
+    print(f"protocolo: {est.get('protocolo')} (adaptador {PROTOCOLO})")
+    if not conectada:
+        print("\nLa extension no esta hablando con el bridge. Comprueba:")
+        print("  1. Vivaldi abierto y la extension activa")
+        print("  2. el host nativo registrado (install-windows.ps1)")
+        print("  3. el log del host: %TEMP%\\hermes_vivaldi_host.log")
+        return 2
+
+    r = llamar("ping", timeout=20)
+    print(f"ping:      ok en {r.get('tookMs')}ms")
+    return 0
+
+
+def cmd_open(a):
+    r = llamar("navigate" if not a.nueva else "tab_open",
+               {"url": a.url, "esperar": a.esperar}, timeout=a.timeout)
+    res = r.get("result", {})
+    print(f"{res.get('url')}  [{res.get('carga')}]"
+          + ("  (redirigido)" if res.get("redirigido") else ""))
+    ev = formatear_evidencia(r)
+    if ev:
+        print(ev)
+    return 0
+
+
+def cmd_look(a):
+    r = llamar("page_summary", {"maxElementos": a.max, "maxTexto": a.texto})
+    salida(r, a.json, formatear_resumen(r))
+    return 0
+
+
+def cmd_click(a):
+    p = objetivo(a)
+    if a.esperar_navegacion:
+        p["esperarNavegacion"] = True
+    if a.coordenadas:
+        p["forzarCoordenadas"] = True
+    r = llamar("click", p)
+    res = r.get("result", {})
+    el = (res.get("elemento") or {}).get("texto") or ""
+    print(f"click ok via {res.get('via')}" + (f' sobre "{_acortar(el, 60)}"' if el else ""))
+    ev = formatear_evidencia(r)
+    if ev:
+        print(ev)
+    return 0
+
+
+def cmd_type(a):
+    p = objetivo(a)
+    p["texto"] = a.text
+    if a.enter:
+        p["enter"] = True
+    if a.no_limpiar:
+        p["limpiar"] = False
+    if a.real:
+        p["real"] = True
+    r = llamar("type", p)
+    res = r.get("result", {})
+    print(f"escrito ({res.get('longitud')} car.) via {res.get('via')}")
+    ev = formatear_evidencia(r)
+    if ev:
+        print(ev)
+    return 0
+
+
+def cmd_press(a):
+    r = llamar("press_key", {"key": a.key, "modificadores": a.mod or [], "repetir": a.repetir})
+    print(f"tecla {a.key} x{a.repetir}")
+    ev = formatear_evidencia(r)
+    if ev:
+        print(ev)
+    return 0
+
+
+def cmd_scroll(a):
+    p: dict = {}
+    if a.a:
+        p["a"] = a.a
+    if a.selector:
+        p["selector"] = a.selector
+    if a.dy is not None:
+        p["dy"] = a.dy
+    r = llamar("scroll", p)
+    res = r.get("result", {})
+    print(f"scroll y={res.get('y')}/{res.get('alturaTotal')}"
+          + ("  (fin de pagina)" if res.get("finDePagina") else ""))
+    return 0
+
+
+def cmd_shot(a):
+    p: dict = {"anchoMax": a.ancho}
+    if a.label:
+        p["etiqueta"] = a.label
+    if a.selector:
+        p["selector"] = a.selector
+    r = llamar("screenshot_full" if a.completa else "screenshot", p)
+    ev = (r.get("evidence") or {}).get("screenshot") or {}
+    res = r.get("result", {})
+    print(f"captura {res.get('ancho')}x{res.get('alto')} ({res.get('kb')} KB)")
+    print(f"path={ev.get('path')}")
+    # Un cosido cortado por el tope de pantallas sigue devolviendo una imagen
+    # valida; sin este aviso el modelo la trataria como la pagina entera.
+    if r.get("estado") == "parcial":
+        print(f"PARCIAL: {r.get('aviso')}")
+    return 0
+
+
+def _analizar(path: str, pregunta: str | None, proveedor: str | None = None,
+              nivel: str | None = None) -> int:
+    if hermes_vision is None:
+        print(f"captura en {path}")
+        print("(sin modulo de vision instalado; si tu modelo ve imagenes, lee el fichero)",
+              file=sys.stderr)
+        return 0
+    try:
+        r = hermes_vision.analizar(path, pregunta, proveedor, None, nivel)
+    except hermes_vision.ErrorVision as e:
+        # No es fatal: la captura existe en disco y un modelo con vision puede
+        # leerla por su cuenta. Se informa del path para que pueda hacerlo.
+        print(f"captura en {path}")
+        print(f"ERROR vision: {e}", file=sys.stderr)
+        return 1
+    if r.get("intentos"):
+        print(f"[backends descartados: {len(r['intentos'])}]", file=sys.stderr)
+    print(f"[vision {r['proveedor']}/{r['modelo']}]")
+    print(r["texto"])
+    print(f"\ncaptura={path}")
+    return 0
+
+
+def cmd_analyze(a):
+    return _analizar(a.shot, a.pregunta, a.proveedor, a.nivel)
+
+
+def cmd_see(a):
+    """Captura y analiza en un paso: el gesto mas comun con diferencia."""
+    p: dict = {"anchoMax": a.ancho}
+    if a.selector:
+        p["selector"] = a.selector
+    if a.label:
+        p["etiqueta"] = a.label
+    r = llamar("screenshot_full" if a.completa else "screenshot", p, timeout=a.timeout)
+
+    if r.get("estado") == "parcial":
+        print(f"AVISO: {r.get('aviso')}", file=sys.stderr)
+
+    shot = (r.get("evidence") or {}).get("screenshot") or {}
+    path = shot.get("path")
+    if not path:
+        print("ERROR: la captura no se guardo en disco", file=sys.stderr)
+        return 1
+    return _analizar(path, a.pregunta, a.proveedor, a.nivel)
+
+
+def cmd_overlay(a):
+    r = llamar("overlay_mode", {"modo": a.modo, "todasLasPestanas": a.todas})
+    res = r.get("result", {})
+    if "pestanas" in res:
+        print(f"overlay {a.modo} en {res['pestanas']}/{res['de']} pestanas")
+    else:
+        print(f"overlay {res.get('modo', a.modo)}")
+    return 0
+
+
+def cmd_highlight(a):
+    p = objetivo(a)
+    if a.etiqueta:
+        p["etiqueta"] = a.etiqueta
+    if a.ms is not None:
+        p["ms"] = a.ms
+    if a.tipo:
+        p["tipo"] = a.tipo
+    llamar("overlay_highlight", p)
+    print("resaltado")
+    return 0
+
+
+def cmd_say(a):
+    llamar("overlay_toast", {"texto": a.texto, "ms": a.ms})
+    print("mostrado")
+    return 0
+
+
+def cmd_site(a):
+    p: dict = {"patron": a.patron, "ajuste": a.ajuste}
+    if a.valor:
+        p["valor"] = a.valor
+    r = llamar("site_settings", p)
+    res = r.get("result", {})
+    print(f"{res.get('ajuste')} en {res.get('patron')}: {res.get('valor')} ({res.get('accion')})")
+    return 0
+
+
+def cmd_wait(a):
+    p: dict = {"timeoutMs": int(a.timeout * 1000)}
+    if a.selector:
+        p["selector"] = a.selector
+    elif a.ms:
+        p["ms"] = a.ms
+    else:
+        p["estado"] = a.estado
+    r = llamar("wait_for", p, timeout=a.timeout + 10)
+    print(json.dumps(r.get("result"), ensure_ascii=False))
+    return 0
+
+
+def cmd_nav(a):
+    r = llamar(a.accion, {})
+    res = r.get("result", {})
+    print(f"{res.get('url')}  [{res.get('carga')}]")
+    return 0
+
+
+def cmd_extract(a):
+    r = llamar("extract", {"tipo": a.tipo, "max": a.max})
+    salida(r, a.json)
+    return 0
+
+
+def cmd_elements(a):
+    p: dict = {"max": a.max}
+    if a.filtro:
+        p["filtro"] = a.filtro
+    r = llamar("elements", p)
+    if a.json:
+        salida(r, True)
+        return 0
+    for e in r.get("result", {}).get("elementos", []):
+        print(f"[{e['ref']}] {e['tag']}"
+              + (f"({e['tipo']})" if e.get("tipo") else "")
+              + (f' "{_acortar(e.get("texto", ""), 60)}"' if e.get("texto") else "")
+              + f"  @{e['centro']['x']},{e['centro']['y']}")
+    return 0
+
+
+def cmd_download(a):
+    r = llamar("download", {"url": a.url, **({"nombre": a.nombre} if a.nombre else {})},
+               timeout=a.timeout)
+    res = r.get("result", {})
+    print(f"descargado: {res.get('fichero')} ({res.get('bytes')} bytes)")
+    return 0
+
+
+def cmd_inbox(a):
+    """Instrucciones escritas por el usuario en el panel lateral.
+
+    Se consumen al leerlas. El skill /vivaldi las sondea para saber si le han
+    pedido algo desde el navegador en vez de desde el chat de Hermes."""
+    r = _http("/inbox", timeout=15)
+    ins = r.get("instrucciones", [])
+    if not ins:
+        print("sin instrucciones pendientes")
+        return 0
+    for i in ins:
+        marca = time.strftime("%H:%M:%S", time.localtime(i.get("ts", 0)))
+        print(f"[{marca}] {i.get('texto')}")
+    return 0
+
+
+def cmd_session(a):
+    r = llamar("session_state", {"historial": a.historial})
+    res = r.get("result", {})
+    print(f"pestana={res.get('tabEnFoco')}  pasos={res.get('pasos')}"
+          + ("  BUCLE DETECTADO" if res.get("enBucle") else ""))
+    print(f"url={res.get('ultimaUrl')}")
+    for h in res.get("historial", []):
+        marca = "ok " if h.get("ok") else "ERR"
+        print(f"  {h['n']:>3} {marca} {h['cmd']:<16} {_acortar(h.get('resumen', ''), 80)}")
+    return 0
+
+
+def cmd_reset(a):
+    llamar("session_reset", {})
+    _estado_escribir({"ultima": None, "repeticiones": 0})
+    print("sesion reiniciada")
+    return 0
+
+
+def cmd_raw(a):
+    params = json.loads(a.json_params) if a.json_params else {}
+    r = llamar(a.cmd, params, timeout=a.timeout)
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_catalogo(a):
+    r = llamar("catalogo", {})
+    if a.json:
+        print(json.dumps(r.get("result"), ensure_ascii=False, indent=2))
+        return 0
+    for c in r.get("result", {}).get("comandos", []):
+        marcas = []
+        if c.get("mutating"):
+            marcas.append("muta")
+        if c.get("needsDebugger"):
+            marcas.append("cdp")
+        print(f"{c['cmd']:<18} [{c['grupo']}]{' ' + ','.join(marcas) if marcas else ''}")
+        print(f"    {c['doc']}")
+    return 0
+
+
+# --------------------------------------------------------------------- main
+
+def construir_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="browser-ctl",
+        description="Capa unica de control del navegador para Hermes (todos los modelos usan esta).",
+    )
+    sub = p.add_subparsers(dest="sub", required=True)
+
+    s = sub.add_parser("status", help="salud del puente y de la extension")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("open", help="navegar a una URL")
+    s.add_argument("url")
+    s.add_argument("--nueva", action="store_true", help="abrir en pestana nueva")
+    s.add_argument("--esperar", default="complete", choices=["dom", "complete", "idle", "none"])
+    s.add_argument("--timeout", type=float, default=45)
+    s.set_defaults(fn=cmd_open)
+
+    s = sub.add_parser("look", help="resumen compacto de la pagina (lectura por defecto)")
+    s.add_argument("--max", type=int, default=60, help="tope de elementos interactivos")
+    s.add_argument("--texto", type=int, default=4000, help="tope de texto")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_look)
+
+    s = sub.add_parser("click", help="pulsar un elemento")
+    anadir_objetivo(s)
+    s.add_argument("--esperar-navegacion", action="store_true")
+    s.add_argument("--coordenadas", action="store_true", help="forzar click real por CDP")
+    s.set_defaults(fn=cmd_click)
+
+    s = sub.add_parser("type", help="escribir en un campo")
+    anadir_objetivo(s)
+    s.add_argument("--text", required=True)
+    s.add_argument("--enter", action="store_true")
+    s.add_argument("--no-limpiar", action="store_true")
+    s.add_argument("--real", action="store_true", help="teclear via CDP (sitios exigentes)")
+    s.set_defaults(fn=cmd_type)
+
+    s = sub.add_parser("press", help="pulsar una tecla")
+    s.add_argument("key")
+    s.add_argument("--mod", action="append", choices=["alt", "ctrl", "meta", "shift"])
+    s.add_argument("--repetir", type=int, default=1)
+    s.set_defaults(fn=cmd_press)
+
+    s = sub.add_parser("scroll", help="desplazar la pagina")
+    s.add_argument("--a", choices=["arriba", "abajo", "elemento"])
+    s.add_argument("--selector")
+    s.add_argument("--dy", type=int)
+    s.set_defaults(fn=cmd_scroll)
+
+    s = sub.add_parser("shot", help="captura de pantalla")
+    s.add_argument("--label")
+    s.add_argument("--selector", help="recortar a este elemento")
+    s.add_argument("--completa", action="store_true", help="pagina entera (mas lento)")
+    s.add_argument("--ancho", type=int, default=1280)
+    s.set_defaults(fn=cmd_shot)
+
+    s = sub.add_parser("see", help="captura Y analiza en un paso (lo habitual)")
+    s.add_argument("--pregunta", help="que quieres saber de la pantalla")
+    s.add_argument("--selector", help="analizar solo este elemento")
+    s.add_argument("--completa", action="store_true", help="pagina entera")
+    s.add_argument("--label")
+    s.add_argument("--ancho", type=int, default=1280)
+    s.add_argument("--timeout", type=float, default=90)
+    s.add_argument("--proveedor", choices=PROVEEDORES_VISION or None,
+                   help="forzar backend de vision (por defecto: cadena automatica)")
+    s.add_argument("--nivel", choices=["rapido", "normal", "profundo"], default="normal",
+                   help="exigencia del modelo via router de Omniroute")
+    s.set_defaults(fn=cmd_see)
+
+    s = sub.add_parser("analyze", help="analizar una captura ya existente")
+    s.add_argument("--shot", required=True, help="ruta del PNG/JPG")
+    s.add_argument("--pregunta")
+    s.add_argument("--proveedor", choices=PROVEEDORES_VISION or None,
+                   help="forzar backend de vision (por defecto: cadena automatica)")
+    s.add_argument("--nivel", choices=["rapido", "normal", "profundo"], default="normal",
+                   help="exigencia del modelo via router de Omniroute")
+    s.set_defaults(fn=cmd_analyze)
+
+    s = sub.add_parser("overlay", help="cursor y marcadores visuales de Hermes")
+    s.add_argument("modo", choices=["off", "normal", "debug"])
+    s.add_argument("--todas", action="store_true", help="aplicar a todas las pestanas")
+    s.set_defaults(fn=cmd_overlay)
+
+    s = sub.add_parser("highlight", help="resaltar un elemento sin actuar sobre el")
+    anadir_objetivo(s)
+    s.add_argument("--etiqueta")
+    s.add_argument("--tipo", choices=["objetivo", "foco", "hover"])
+    s.add_argument("--ms", type=int)
+    s.set_defaults(fn=cmd_highlight)
+
+    s = sub.add_parser("say", help="mostrar un mensaje de Hermes sobre la pagina")
+    s.add_argument("texto")
+    s.add_argument("--ms", type=int, default=2600)
+    s.set_defaults(fn=cmd_say)
+
+    s = sub.add_parser("site", help="permisos del navegador para un sitio")
+    s.add_argument("patron", help='p.ej. "https://ejemplo.com/*"')
+    s.add_argument("ajuste", choices=["camera", "microphone", "notifications", "javascript",
+                                      "images", "popups", "location", "cookies"])
+    s.add_argument("--valor", choices=["allow", "block", "ask", "session_only"],
+                   help="omitir para solo consultar")
+    s.set_defaults(fn=cmd_site)
+
+    s = sub.add_parser("wait", help="esperar a un selector, un estado o un tiempo")
+    s.add_argument("--selector")
+    s.add_argument("--ms", type=int)
+    s.add_argument("--estado", default="complete", choices=["dom", "complete", "idle"])
+    s.add_argument("--timeout", type=float, default=20)
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("nav", help="atras / adelante / recargar")
+    s.add_argument("accion", choices=["back", "forward", "reload"])
+    s.set_defaults(fn=cmd_nav)
+
+    s = sub.add_parser("extract", help="extraer colecciones tipadas")
+    s.add_argument("tipo", choices=["links", "forms", "images", "videos", "tables", "meta"])
+    s.add_argument("--max", type=int, default=100)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_extract)
+
+    s = sub.add_parser("elements", help="listar interactivos con sus coordenadas")
+    s.add_argument("--max", type=int, default=60)
+    s.add_argument("--filtro")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_elements)
+
+    s = sub.add_parser("download", help="descargar una URL")
+    s.add_argument("url")
+    s.add_argument("--nombre")
+    s.add_argument("--timeout", type=float, default=180)
+    s.set_defaults(fn=cmd_download)
+
+    s = sub.add_parser("inbox", help="instrucciones pendientes del panel lateral")
+    s.set_defaults(fn=cmd_inbox)
+
+    s = sub.add_parser("session", help="estado e historial de la sesion")
+    s.add_argument("--historial", type=int, default=10)
+    s.set_defaults(fn=cmd_session)
+
+    s = sub.add_parser("reset", help="reiniciar la sesion y el contador de bucles")
+    s.set_defaults(fn=cmd_reset)
+
+    s = sub.add_parser("catalogo", help="comandos disponibles en la extension")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_catalogo)
+
+    s = sub.add_parser("raw", help="comando crudo del protocolo")
+    s.add_argument("cmd")
+    s.add_argument("--json-params", help='JSON con los parametros, p.ej. \'{"max":100}\'')
+    s.add_argument("--timeout", type=float, default=60)
+    s.set_defaults(fn=cmd_raw)
+
+    return p
+
+
+def main(argv=None) -> int:
+    a = construir_parser().parse_args(argv)
+    try:
+        return a.fn(a)
+    except ErrorControlador as e:
+        print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
+        if e.detail:
+            print(f"  {e.detail}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,74 @@
+name: sahacloud-core
+
+networks:
+  # Shared network: Caddy + all app containers attach here
+  sahacloud-net:
+    name: sahacloud-net
+    driver: bridge
+  # Internal: only postgres + redis + other core services
+  core-internal:
+    driver: bridge
+    internal: true
+
+services:
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: sahacloud-caddy
+    restart: unless-stopped
+    mem_limit: 128m
+    memswap_limit: 192m
+    ports:
+      - "127.0.0.1:8080:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /home/sahacloud/sahacloud-infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /opt/sahacloud/data/caddy/data:/data
+      - /opt/sahacloud/data/caddy/config:/config
+    networks:
+      - sahacloud-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: sahacloud-postgres
+    restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 768m
+    env_file:
+      - /home/sahacloud/sahacloud-infra/env/core.env
+    volumes:
+      - /opt/sahacloud/data/postgres:/var/lib/postgresql/data
+      - /home/sahacloud/sahacloud-infra/stacks/core/initdb:/docker-entrypoint-initdb.d:ro
+    networks:
+      - core-internal
+      - sahacloud-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sahacloud_admin -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    shm_size: 128mb
+
+  redis:
+    image: redis:7-alpine
+    container_name: sahacloud-redis
+    restart: unless-stopped
+    mem_limit: 128m
+    memswap_limit: 192m
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - /opt/sahacloud/data/redis:/data
+    networks:
+      - core-internal
+      - sahacloud-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3

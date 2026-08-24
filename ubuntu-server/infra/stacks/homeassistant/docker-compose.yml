@@ -1,0 +1,43 @@
+name: sahacloud-homeassistant
+
+# Home Assistant — smart-home hub, controlado por Hermes vía REST API.
+# Acceso remoto: cloudflared → Caddy (sahacloud-net) → este contenedor.
+# Red bridge (no host/privileged) para respetar la postura de seguridad del stack.
+# Nota: en este modo NO hay descubrimiento local de dispositivos (mDNS/Bluetooth/
+# dongles USB Zigbee/Z-Wave). Si más adelante conectas hardware físico del hogar,
+# habrá que pasar a network_mode: host. Para control cloud/API esto sobra.
+
+networks:
+  sahacloud-net:
+    external: true
+
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: sahacloud-homeassistant
+    restart: unless-stopped
+    mem_limit: 768m
+    memswap_limit: 1024m
+    # Puerto solo en loopback del host: permite curl/Hermes local sin pasar por el túnel.
+    # Caddy llega por nombre de contenedor (sahacloud-homeassistant:8123), NO por este bind.
+    # Host:8124 (no 8123) porque 8123 lo ocupa graphify-viewer.service en el host.
+    ports:
+      - "127.0.0.1:8124:8123"
+    volumes:
+      - ./config:/config
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - sahacloud-net
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8123/manifest.json').status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

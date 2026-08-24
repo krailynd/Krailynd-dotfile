@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""imgdl — descargar imagenes de una URL directa o de todas las de una pagina.
+
+    imgdl <url-imagen>                     una imagen
+    imgdl --page <url> [--max 20]          todas las imagenes de la pagina
+    imgdl --page <url> --min-bytes 20000   descartar iconos/tracking pixels
+    imgdl <url> --out ~/otra/carpeta       destino distinto
+
+Destino por defecto: ~/Downloads/images/
+Nombres: <host>_<indice>_<hash>.<ext> — sin colisiones, trazable al origen.
+"""
+import argparse
+import hashlib
+import os
+import re
+import sys
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
+
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+EXT_BY_MIME = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp", "image/svg+xml": ".svg", "image/avif": ".avif",
+    "image/bmp": ".bmp", "image/x-icon": ".ico",
+}
+
+
+class ImgFinder(HTMLParser):
+    """Extrae src/data-src/srcset. Un parser real, no una regex frágil."""
+
+    def __init__(self):
+        super().__init__()
+        self.urls: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in ("img", "source"):
+            return
+        a = dict(attrs)
+        for key in ("src", "data-src", "data-original", "data-lazy-src"):
+            if a.get(key):
+                self.urls.append(a[key])
+        if a.get("srcset"):
+            # "url 1x, url 2x" — quedarse con la primera de cada par
+            for part in a["srcset"].split(","):
+                candidate = part.strip().split(" ")[0]
+                if candidate:
+                    self.urls.append(candidate)
+
+
+def get(url: str, timeout: int = 20):
+    return urlopen(Request(url, headers={"User-Agent": UA}), timeout=timeout)
+
+
+def save(url: str, outdir: Path, index: int, min_bytes: int) -> Path | None:
+    try:
+        with get(url) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+            if not ctype.startswith("image/"):
+                print(f"  omitida (no es imagen: {ctype or 'sin tipo'}): {url[:80]}")
+                return None
+            data = resp.read()
+    except Exception as exc:
+        print(f"  fallo: {type(exc).__name__}: {url[:80]}")
+        return None
+
+    if len(data) < min_bytes:
+        print(f"  omitida ({len(data)} B < {min_bytes}): {url[:80]}")
+        return None
+
+    ext = EXT_BY_MIME.get(ctype) or (Path(urlparse(url).path).suffix or ".bin")
+    host = (urlparse(url).hostname or "local").replace(".", "-")
+    digest = hashlib.sha256(data).hexdigest()[:8]
+    target = outdir / f"{host}_{index:03d}_{digest}{ext}"
+
+    if target.exists():
+        print(f"  ya existe: {target.name}")
+        return target
+
+    target.write_bytes(data)
+    print(f"  {target.name}  ({len(data):,} B)")
+    return target
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Descargar imagenes")
+    ap.add_argument("url")
+    ap.add_argument("--page", action="store_true", help="tratar la URL como pagina y bajar sus imagenes")
+    ap.add_argument("--max", type=int, default=20)
+    ap.add_argument("--min-bytes", type=int, default=1024)
+    ap.add_argument("--out", default=str(Path.home() / "Downloads" / "images"))
+    args = ap.parse_args()
+
+    outdir = Path(os.path.expanduser(args.out))
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if not args.page:
+        print(f"destino: {outdir}")
+        return 0 if save(args.url, outdir, 0, args.min_bytes) else 1
+
+    try:
+        with get(args.url) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            html = resp.read().decode(charset, "replace")
+    except Exception as exc:
+        print(f"no se pudo leer la pagina: {exc}", file=sys.stderr)
+        return 1
+
+    finder = ImgFinder()
+    finder.feed(html)
+
+    # CSS background-image, que el parser HTML no ve
+    finder.urls += re.findall(r"background-image:\s*url\(['\"]?([^'\")]+)", html)
+
+    seen, absolute = set(), []
+    for raw in finder.urls:
+        if raw.startswith("data:"):
+            continue
+        full = urljoin(args.url, raw)
+        if full not in seen:
+            seen.add(full)
+            absolute.append(full)
+
+    print(f"encontradas {len(absolute)} candidatas; bajando hasta {args.max}")
+    print(f"destino: {outdir}")
+
+    ok = 0
+    for i, u in enumerate(absolute[: args.max]):
+        if save(u, outdir, i, args.min_bytes):
+            ok += 1
+
+    print(f"\n{ok} imagen(es) descargada(s) en {outdir}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

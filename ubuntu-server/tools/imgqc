@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""imgqc — control de calidad de imagenes generadas, antes de entregarlas.
+
+Comprueba lo que SI se puede medir sin modelo de vision: resolucion, exposicion,
+recorte de luces/sombras, nitidez, saturacion, franjas de color (banding),
+bordes planos (relleno vacio) y proporcion.
+
+LIMITE HONESTO: esto no "ve" la imagen. No detecta manos con seis dedos,
+perspectiva imposible ni texto ilegible — para eso hace falta que el agente
+MIRE la imagen con su capacidad de vision. Este script filtra los fallos
+mecanicos; el juicio visual sigue siendo del agente.
+
+    imgqc FOTO_O_DIRECTORIO [--min-mp 1.0] [--strict]
+
+Sale con codigo 1 si alguna imagen falla un criterio duro.
+"""
+import argparse
+import sys
+from pathlib import Path
+
+from PIL import Image, ImageFilter, ImageOps, ImageStat
+
+EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+
+
+def check(p: Path, min_mp: float, strict: bool) -> list[tuple[str, str]]:
+    """Devuelve lista de (nivel, mensaje). nivel: FALLO | AVISO."""
+    out: list[tuple[str, str]] = []
+    im = ImageOps.exif_transpose(Image.open(p))
+    rgb = im.convert("RGB")
+    gray = rgb.convert("L")
+    w, h = rgb.size
+    mp = w * h / 1_000_000
+
+    # --- resolucion
+    if mp < min_mp:
+        out.append(("FALLO", f"{w}x{h} = {mp:.2f} MP, por debajo del minimo {min_mp} MP"))
+    if min(w, h) < 512:
+        out.append(("AVISO", f"lado corto {min(w, h)}px; escaso para recorte o impresion"))
+
+    # --- exposicion
+    st = ImageStat.Stat(gray)
+    mean, sd = st.mean[0], st.stddev[0]
+    if mean < 40:
+        out.append(("AVISO", f"muy oscura (brillo medio {mean:.0f}/255)"))
+    elif mean > 215:
+        out.append(("AVISO", f"muy clara (brillo medio {mean:.0f}/255)"))
+    if sd < 18:
+        out.append(("AVISO", f"contraste plano (desviacion {sd:.0f}); imagen apagada"))
+
+    # --- recorte de luces y sombras
+    hist = gray.histogram()
+    total = w * h
+    negros = sum(hist[:4]) / total
+    blancos = sum(hist[252:]) / total
+    if negros > 0.12:
+        out.append(("AVISO", f"{negros*100:.0f}% de pixeles en negro puro; sombras quemadas"))
+    if blancos > 0.12:
+        out.append(("AVISO", f"{blancos*100:.0f}% de pixeles en blanco puro; altas luces quemadas"))
+
+    # --- nitidez
+    sharp = ImageStat.Stat(gray.filter(ImageFilter.FIND_EDGES)).stddev[0]
+    if sharp < 8:
+        out.append(("FALLO", f"nitidez de bordes {sharp:.1f}; imagen borrosa o sobre-suavizada"))
+    elif sharp < 14:
+        out.append(("AVISO", f"nitidez de bordes {sharp:.1f}; blanda, considera `imgfx sharpen`"))
+
+    # --- saturacion
+    hsv = rgb.convert("HSV")
+    sat = ImageStat.Stat(hsv).mean[1]
+    if sat > 200:
+        out.append(("AVISO", f"saturacion {sat:.0f}/255; colores irreales"))
+    elif sat < 25:
+        out.append(("AVISO", f"saturacion {sat:.0f}/255; practicamente monocroma"))
+
+    # --- banding: pocos niveles distintos = degradados en escalones
+    niveles = sum(1 for v in hist if v > total * 0.0002)
+    if niveles < 40:
+        out.append(("AVISO", f"solo {niveles} niveles de luminancia; posible banding o sobrecompresion"))
+
+    # --- bordes planos: barras/relleno vacio alrededor
+    borde = 6
+    for nombre, caja in (
+        ("superior", (0, 0, w, borde)), ("inferior", (0, h - borde, w, h)),
+        ("izquierdo", (0, 0, borde, h)), ("derecho", (w - borde, 0, w, h)),
+    ):
+        if ImageStat.Stat(gray.crop(caja)).stddev[0] < 1.0:
+            out.append(("AVISO", f"borde {nombre} completamente plano; relleno o barra vacia"))
+
+    # --- proporcion
+    ratio = w / h
+    if ratio > 3.2 or ratio < 0.31:
+        out.append(("AVISO", f"proporcion extrema {ratio:.2f}:1"))
+
+    if strict:
+        out = [("FALLO", m) if n == "AVISO" else (n, m) for n, m in out]
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Control de calidad de imagenes")
+    ap.add_argument("path")
+    ap.add_argument("--min-mp", type=float, default=1.0)
+    ap.add_argument("--strict", action="store_true", help="tratar los avisos como fallos")
+    a = ap.parse_args()
+
+    src = Path(a.path).expanduser()
+    files = sorted(f for f in src.iterdir() if f.suffix.lower() in EXTS) if src.is_dir() else [src]
+    if not files:
+        print(f"sin imagenes en {src}", file=sys.stderr)
+        return 2
+
+    fallos = 0
+    for f in files:
+        try:
+            res = check(f, a.min_mp, a.strict)
+        except Exception as exc:
+            print(f"{f.name}: ILEGIBLE ({type(exc).__name__})")
+            fallos += 1
+            continue
+
+        duros = [m for n, m in res if n == "FALLO"]
+        if not res:
+            print(f"[OK]    {f.name}")
+        else:
+            print(f"[{'FALLO' if duros else 'AVISO'}] {f.name}")
+            for nivel, msg in res:
+                print(f"          {nivel}: {msg}")
+        fallos += bool(duros)
+
+    print(f"\n{len(files)} revisada(s), {fallos} con fallo duro.")
+    if fallos:
+        print("Corrige con `imgfx pipeline` o regenera antes de entregar.")
+    print("Recuerda: esto no sustituye MIRAR la imagen (manos, texto, perspectiva, anatomia).")
+    return 1 if fallos else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

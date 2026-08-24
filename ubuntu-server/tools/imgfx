@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""imgfx — postproceso de imagenes con Pillow. Sin torch, sin GPU, sin sudo.
+
+Pensado para correr DESPUES de generar: sube resolucion, corrige color y
+contraste, afila y prepara entregables. En una VM sin GPU esto es lo unico
+que rinde; Real-ESRGAN/GFPGAN necesitan torch + CUDA y aqui no hay.
+
+    imgfx upscale  FOTO [--factor 2] [--out DIR]     ampliar (LANCZOS + unsharp)
+    imgfx color    FOTO [--auto] [--sat 1.15] ...    contraste/saturacion/calidez
+    imgfx sharpen  FOTO [--amount 1.4]               nitidez controlada
+    imgfx crop     FOTO --ratio 16:9                 recorte centrado a proporcion
+    imgfx pad      FOTO --ratio 1:1 [--color white]  ampliar lienzo sin recortar
+    imgfx pipeline FOTO [--factor 2]                 upscale + auto color + sharpen
+    imgfx info     FOTO                              diagnostico
+
+Acepta un archivo o un directorio (procesa todas las imagenes).
+Nunca sobrescribe: escribe <nombre>_<op>.<ext> salvo que se indique --out.
+"""
+import argparse
+import sys
+from pathlib import Path
+
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat
+
+EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+MAX_PIXELS = 40_000_000          # tope de seguridad: 1.6 GB de RAM libre en esta VM
+
+
+def targets(p: Path) -> list[Path]:
+    if p.is_dir():
+        return sorted(f for f in p.iterdir() if f.suffix.lower() in EXTS)
+    return [p] if p.suffix.lower() in EXTS else []
+
+
+def load(p: Path) -> Image.Image:
+    im = Image.open(p)
+    im = ImageOps.exif_transpose(im)          # respeta la orientacion de camara
+    return im.convert("RGB") if im.mode not in ("RGB", "L") else im
+
+
+def save(im: Image.Image, src: Path, op: str, out: str | None) -> Path:
+    if out:
+        d = Path(out).expanduser()
+        d.mkdir(parents=True, exist_ok=True)
+        dest = d / src.name
+    else:
+        dest = src.with_name(f"{src.stem}_{op}{src.suffix}")
+    im.save(dest, quality=95, subsampling=0 if src.suffix.lower() in (".jpg", ".jpeg") else None)
+    print(f"  {dest.name}  {im.width}x{im.height}  {dest.stat().st_size / 1024:.0f}KB")
+    return dest
+
+
+def do_upscale(im: Image.Image, factor: float) -> Image.Image:
+    w, h = int(im.width * factor), int(im.height * factor)
+    if w * h > MAX_PIXELS:
+        raise SystemExit(f"resultado {w}x{h} excede el tope de {MAX_PIXELS:,} px; baja --factor")
+    im = im.resize((w, h), Image.LANCZOS)
+    # LANCZOS conserva detalle pero deja el borde blando; unsharp lo recupera
+    return im.filter(ImageFilter.UnsharpMask(radius=2, percent=60, threshold=3))
+
+
+def do_color(im: Image.Image, a) -> Image.Image:
+    if a.auto:
+        # autocontraste conservador: 0.5% recortado por extremo, sin virar el color
+        im = ImageOps.autocontrast(im, cutoff=0.5, preserve_tone=True)
+    if a.sat != 1.0:
+        im = ImageEnhance.Color(im).enhance(a.sat)
+    if a.contrast != 1.0:
+        im = ImageEnhance.Contrast(im).enhance(a.contrast)
+    if a.bright != 1.0:
+        im = ImageEnhance.Brightness(im).enhance(a.bright)
+    if a.warm != 0:
+        r, g, b = im.split()
+        k = a.warm
+        r = r.point(lambda v: min(255, int(v * (1 + 0.12 * k))))
+        b = b.point(lambda v: max(0, int(v * (1 - 0.12 * k))))
+        im = Image.merge("RGB", (r, g, b))
+    return im
+
+
+def parse_ratio(s: str) -> float:
+    try:
+        w, h = s.split(":")
+        return float(w) / float(h)
+    except Exception:
+        raise SystemExit(f"proporcion invalida: {s!r} (usa 16:9, 1:1, 4:5...)")
+
+
+def do_crop(im: Image.Image, ratio: float) -> Image.Image:
+    cur = im.width / im.height
+    if abs(cur - ratio) < 0.001:
+        return im
+    if cur > ratio:                            # sobra ancho
+        w = int(im.height * ratio)
+        x = (im.width - w) // 2
+        return im.crop((x, 0, x + w, im.height))
+    h = int(im.width / ratio)                  # sobra alto
+    y = (im.height - h) // 2
+    return im.crop((0, y, im.width, y + h))
+
+
+def do_pad(im: Image.Image, ratio: float, color: str) -> Image.Image:
+    cur = im.width / im.height
+    if cur > ratio:
+        w, h = im.width, int(im.width / ratio)
+    else:
+        w, h = int(im.height * ratio), im.height
+    canvas = Image.new("RGB", (w, h), color)
+    canvas.paste(im, ((w - im.width) // 2, (h - im.height) // 2))
+    return canvas
+
+
+def do_info(im: Image.Image, p: Path) -> None:
+    gray = im.convert("L")
+    st = ImageStat.Stat(gray)
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    sharp = ImageStat.Stat(edges).stddev[0]
+    mp = im.width * im.height / 1_000_000
+    print(f"{p.name}")
+    print(f"  {im.width}x{im.height} ({mp:.1f} MP)  modo={im.mode}  {p.stat().st_size/1024:.0f}KB")
+    print(f"  brillo medio {st.mean[0]:.0f}/255   contraste (desv) {st.stddev[0]:.0f}")
+    print(f"  nitidez de bordes {sharp:.1f}", end="  ")
+    print("BLANDA — considera sharpen/upscale" if sharp < 12 else "correcta")
+    if mp < 1:
+        print("  AVISO: por debajo de 1 MP. Escasa para impresion o pantalla grande.")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Postproceso de imagenes (Pillow)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("upscale", "color", "sharpen", "crop", "pad", "pipeline", "info"):
+        s = sub.add_parser(name)
+        s.add_argument("path")
+        s.add_argument("--out", default=None)
+        if name in ("upscale", "pipeline"):
+            s.add_argument("--factor", type=float, default=2.0)
+        if name in ("color", "pipeline"):
+            s.add_argument("--auto", action="store_true")
+            s.add_argument("--sat", type=float, default=1.0)
+            s.add_argument("--contrast", type=float, default=1.0)
+            s.add_argument("--bright", type=float, default=1.0)
+            s.add_argument("--warm", type=float, default=0.0)
+        if name == "sharpen":
+            s.add_argument("--amount", type=float, default=1.4)
+        if name in ("crop", "pad"):
+            s.add_argument("--ratio", required=True)
+        if name == "pad":
+            s.add_argument("--color", default="white")
+
+    a = ap.parse_args()
+    src = Path(a.path).expanduser()
+    files = targets(src)
+    if not files:
+        print(f"sin imagenes en {src}", file=sys.stderr)
+        return 1
+
+    for f in files:
+        try:
+            im = load(f)
+            if a.cmd == "info":
+                do_info(im, f)
+                continue
+            if a.cmd == "upscale":
+                im = do_upscale(im, a.factor)
+            elif a.cmd == "color":
+                im = do_color(im, a)
+            elif a.cmd == "sharpen":
+                im = ImageEnhance.Sharpness(im).enhance(a.amount)
+            elif a.cmd == "crop":
+                im = do_crop(im, parse_ratio(a.ratio))
+            elif a.cmd == "pad":
+                im = do_pad(im, parse_ratio(a.ratio), a.color)
+            elif a.cmd == "pipeline":
+                a.auto = True
+                im = do_upscale(im, a.factor)
+                im = do_color(im, a)
+                im = ImageEnhance.Sharpness(im).enhance(1.2)
+            save(im, f, a.cmd, a.out)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            print(f"  fallo {f.name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

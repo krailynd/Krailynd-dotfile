@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# agentguard — escaneo estatico de skills de terceros antes de habilitarlas.
+#
+# NO es un sandbox ni una garantia de seguridad. Es un filtro de patrones
+# obvios: detecta lo evidente, no detecta ofuscacion. Un skill que pasa este
+# scan sigue necesitando revision humana antes de darle credenciales.
+set -uo pipefail
+
+TARGET="${1:-}"
+if [ -z "$TARGET" ]; then
+  echo "uso: agentguard <directorio>" >&2
+  exit 2
+fi
+if [ ! -d "$TARGET" ]; then
+  echo "agentguard: no es un directorio: $TARGET" >&2
+  exit 2
+fi
+
+echo "[SCAN] $TARGET"
+findings=0
+blocked=0
+
+scan() {                     # scan <etiqueta> <severidad> <regex>
+  local label="$1" sev="$2" pattern="$3"
+  local hits
+  hits=$(grep -rInE "$pattern" "$TARGET" \
+          --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=__pycache__ \
+          2>/dev/null | head -5) || true
+  if [ -n "$hits" ]; then
+    echo "[$sev] $label"
+    printf '        %s\n' "$hits"
+    findings=$((findings + 1))
+    [ "$sev" = "BLOCK" ] && blocked=$((blocked + 1))
+  fi
+}
+
+# Destructivo
+scan "rm -rf sobre raiz o \$HOME"      BLOCK 'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+(/|\$HOME|~)[[:space:]]*($|[^a-zA-Z0-9_.-])'
+scan "mkfs / dd sobre dispositivo"     BLOCK 'mkfs|dd[[:space:]]+if=.*of=/dev/'
+scan "fork bomb"                       BLOCK ':\(\)\{.*\|.*&.*\};:'
+
+# Ejecucion remota
+scan "descarga tuberia a shell"        WARN  '(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba)?sh'
+scan "eval / exec dinamico"            WARN  '\b(eval|exec)[[:space:]]*\('
+scan "python -c con input remoto"      WARN  'python3?[[:space:]]+-c.*urlopen|requests\.get'
+
+# Credenciales
+scan "posible secreto embebido"        WARN  '(api[_-]?key|secret|token|password)[[:space:]]*=[[:space:]]*["'"'"'][A-Za-z0-9_/+-]{16,}'
+scan "lectura de credenciales"         WARN  '\.env|\.ssh/|id_rsa|credentials\.json|\.aws/'
+scan "exfiltracion a host externo"     WARN  '(curl|wget).*(-d|--data|-F).*https?://'
+
+# Persistencia
+scan "escritura en rc/perfil de shell" WARN  '>>[[:space:]]*(~|\$HOME)/\.(bashrc|zshrc|profile)'
+scan "crontab / systemd"               WARN  'crontab[[:space:]]+-|systemctl[[:space:]]+(enable|start)'
+scan "sudo"                            WARN  '\bsudo\b'
+
+echo
+if [ "$blocked" -gt 0 ]; then
+  echo "[BLOCK] $blocked patron(es) criticos. NO habilitar sin revisar."
+  exit 1
+fi
+if [ "$findings" -gt 0 ]; then
+  echo "[WARN] $findings patron(es) a revisar. Scan completado."
+  exit 0
+fi
+echo "[OK] sin patrones sospechosos."

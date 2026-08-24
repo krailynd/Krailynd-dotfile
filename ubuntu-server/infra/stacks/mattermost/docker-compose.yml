@@ -1,0 +1,14 @@
+# mattermost — example stack (placeholder). Adapt from other stacks.
+# Uses ${VAR} from ~/sahacloud-infra/env/mattermost.env — never hardcode secrets.
+networks:
+  sahacloud-net:
+    external: true
+services:
+  mattermost:
+    image: REPLACE_WITH_IMAGE:latest
+    container_name: sahacloud-mattermost
+    restart: unless-stopped
+    env_file:
+      - /home/sahacloud/sahacloud-infra/env/mattermost.env
+    networks:
+      - sahacloud-net

@@ -1,0 +1,5 @@
+# gh hosts — example (sanitized). Real file contains OAuth tokens — never commit.
+github.com:
+  user: REPLACE_WITH_GITHUB_USER
+  oauth_token: gho_REPLACE_WITH_TOKEN
+  git_protocol: https

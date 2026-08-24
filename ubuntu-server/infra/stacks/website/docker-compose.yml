@@ -1,0 +1,32 @@
+name: sahacloud-website
+
+networks:
+  sahacloud-net:
+    external: true
+
+services:
+
+  website:
+    build:
+      context: /home/sahacloud/SahaCloud/proyectos/website
+      dockerfile: Dockerfile
+    image: sahacloud-website:latest
+    container_name: sahacloud-website
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 384m
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+    networks:
+      - sahacloud-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/', r => process.exit(r.statusCode < 400 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true

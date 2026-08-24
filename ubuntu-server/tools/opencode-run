@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# opencode-run — invoke opencode non-interactively for a specific project and task
+# Usage: opencode-run <project-path> "<task description>"
+# Example: opencode-run ~/SahaCloud/projects/my-api "add input validation to POST /users"
+#
+# Hermes can call this via its terminal tool to delegate coding tasks to opencode.
+
+set -euo pipefail
+
+OPENCODE_BIN="${OPENCODE_BIN:-/home/sahacloud/.opencode/bin/opencode}"
+PROJECT="${1:?Usage: opencode-run <project-path> <task>}"
+TASK="${2:?Usage: opencode-run <project-path> <task>}"
+
+if [[ ! -d "$PROJECT" ]]; then
+  echo "ERROR: project path does not exist: $PROJECT" >&2
+  exit 1
+fi
+
+if [[ ! -x "$OPENCODE_BIN" ]]; then
+  echo "ERROR: opencode binary not found at $OPENCODE_BIN" >&2
+  exit 1
+fi
+
+echo "=== opencode task ==="
+echo "Project : $PROJECT"
+echo "Task    : $TASK"
+echo "========================"
+
+"$OPENCODE_BIN" run --dir "$PROJECT" "$TASK"

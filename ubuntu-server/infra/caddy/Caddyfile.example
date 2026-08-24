@@ -1,0 +1,182 @@
+# Caddyfile — example (sanitized). Copy to ~/sahacloud-infra/caddy/Caddyfile
+# Replace {$PREVIEW_HASH} with `caddy hash-password` output. Never commit real bcrypt hashes.
+
+# Caddyfile — SahaCloud internal reverse proxy
+# Listens on :80 only. TLS is terminated by Cloudflare Tunnel upstream.
+# All app containers reachable via sahacloud-net Docker network.
+# Named blocks use http:// prefix so Caddy binds them to :80, not :443.
+
+{
+  admin off
+  auto_https off
+  log {
+    level WARN
+  }
+}
+
+# Health check endpoint (catch-all for unmatched hosts, and /health path)
+:80 {
+  handle /health {
+    respond "OK" 200
+  }
+}
+
+# ── Public website (Next.js) ────────────────────────────────
+http://sahacloud.dpdns.org {
+  reverse_proxy sahacloud-website:3000 {
+    header_up Host {host}
+    header_up X-Real-IP {remote_host}
+    header_up X-Forwarded-Proto https
+  }
+
+  header {
+    -Server
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "SAMEORIGIN"
+    Referrer-Policy "strict-origin-when-cross-origin"
+  }
+}
+
+# ── SahaTools ────────────────────────────────────────────────
+# basicauth: protects the admin panel (Docker socket, system tools, compiler).
+# User: admin  Password: {$PREVIEW_PASSWORD}
+http://sahatools.sahacloud.dpdns.org {
+  basicauth {
+    admin {$PREVIEW_HASH}
+  }
+
+  reverse_proxy sahacloud-sahatools:8080 {
+    header_up Host {host}
+    header_up X-Real-IP {remote_host}
+    header_up X-Forwarded-Proto https
+  }
+
+  header {
+    -Server
+  }
+}
+
+# ── SahaHacking (PHP site) ───────────────────────────────────
+http://sahahacking.sahacloud.dpdns.org {
+  encode zstd gzip
+
+  reverse_proxy sahacloud-sahahacking:80 {
+    header_up Host {host}
+    header_up X-Real-IP {remote_host}
+    header_up X-Forwarded-Proto https
+  }
+
+  header {
+    -Server
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "SAMEORIGIN"
+    Referrer-Policy "strict-origin-when-cross-origin"
+  }
+}
+
+# ── AliasVault (self-hosted password manager, vault-only scope) ─────
+# Bundled nginx+Let's Encrypt reverse-proxy and smtp (email aliasing)
+# intentionally not deployed — see docker-compose.yml comment. Path-based
+# routing mirrors what AliasVault's own reverse-proxy would do.
+# /admin is the operator panel (not the user vault) — gated with basicauth
+# per AliasVault's own recommendation (their ADMIN_IP_ALLOWLIST setting).
+# User vault itself (/  and /api) relies on AliasVault's own zero-knowledge
+# auth (E2E encrypted, master password never leaves the client).
+http://vault.sahacloud.dpdns.org {
+  handle /admin* {
+    basicauth {
+      admin {$PREVIEW_HASH}
+    }
+    reverse_proxy sahacloud-aliasvault-admin:3002 {
+      header_up Host {host}
+      header_up X-Real-IP {remote_host}
+      header_up X-Forwarded-Proto https
+    }
+  }
+
+  handle /api* {
+    reverse_proxy sahacloud-aliasvault-api:3001 {
+      header_up Host {host}
+      header_up X-Real-IP {remote_host}
+      header_up X-Forwarded-Proto https
+    }
+  }
+
+  handle {
+    reverse_proxy sahacloud-aliasvault-client:3000 {
+      header_up Host {host}
+      header_up X-Real-IP {remote_host}
+      header_up X-Forwarded-Proto https
+    }
+  }
+
+  header {
+    -Server
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "SAMEORIGIN"
+    Referrer-Policy "strict-origin-when-cross-origin"
+  }
+}
+
+# ── SahaHacking DEV (copia de trabajo, para previsualizar ediciones) ──
+# Protegido con basicauth: muestra errores PHP en detalle, no debe quedar público.
+# User: dev  Password: {$PREVIEW_PASSWORD}
+http://sahahacking-dev.sahacloud.dpdns.org {
+  basicauth {
+    dev {$PREVIEW_HASH}
+  }
+
+  reverse_proxy sahacloud-sahahacking-dev:80 {
+    header_up Host {host}
+    header_up X-Real-IP {remote_host}
+    header_up X-Forwarded-Proto https
+  }
+
+  header {
+    -Server
+    X-Robots-Tag "noindex, nofollow"
+  }
+}
+
+# ── Preview temporal (puerto 4400 en host) ───────────────────
+# Basicauth protegido. Un solo preview a la vez.
+# Usa host.docker.internal para llegar al proceso en el host.
+# User: preview  Password: {$PREVIEW_PASSWORD}
+# Activar: ~/sahacloud-infra/scripts/start-preview.sh <proyecto>
+# Apagar:  ~/sahacloud-infra/scripts/stop-preview.sh
+http://preview.sahacloud.dpdns.org {
+  basicauth {
+    preview {$PREVIEW_HASH}
+  }
+
+  reverse_proxy host.docker.internal:4400 {
+    header_up Host {host}
+    header_up X-Real-IP {remote_host}
+    header_up X-Forwarded-Proto https
+  }
+
+  header {
+    -Server
+    X-Robots-Tag "noindex, nofollow"
+  }
+}
+
+# ── Home Assistant (smart-home hub, controlado por Hermes vía REST API) ──
+# Caddy → sahacloud-homeassistant:8123 (contenedor en sahacloud-net).
+# HA valida X-Forwarded-For contra trusted_proxies (172.18.0.0/16) en su
+# configuration.yaml. Sin basicauth: HA tiene su propio login + tokens.
+http://homeassistant.sahacloud.dpdns.org {
+  reverse_proxy sahacloud-homeassistant:8123 {
+    header_up Host {host}
+    header_up X-Real-IP {remote_host}
+    header_up X-Forwarded-Proto https
+  }
+
+  header {
+    -Server
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "SAMEORIGIN"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    X-Robots-Tag "noindex, nofollow"
+  }
+}

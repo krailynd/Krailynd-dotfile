@@ -1,0 +1,16 @@
+; ~/.gitconfig — example (sanitized). Copy to ~/.gitconfig and fill user.
+[credential "https://github.com"]
+	helper =
+	helper = !/usr/bin/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper =
+	helper = !/usr/bin/gh auth git-credential
+[user]
+	name = Your Name
+	email = you@example.com
+[init]
+	defaultBranch = main
+[core]
+	editor = nano
+[pull]
+	rebase = false

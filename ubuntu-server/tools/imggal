@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""imggal — organizar imagenes con Pillow. No necesita ImageMagick ni sudo.
+
+    imggal list [DIR]                        listar con dimensiones y peso
+    imggal thumbs [DIR] [--size 200]         miniaturas en DIR/thumbnails/
+    imggal sheet [DIR] [--cols 4] [--cell 200]   hoja de contacto
+    imggal resize [DIR] [--max 1920]         reducir in-place (solo si excede)
+    imggal convert [DIR] --to webp           convertir formato
+    imggal dedupe [DIR]                      listar duplicados por contenido
+
+DIR por defecto: ~/Downloads/images
+"""
+import argparse
+import hashlib
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+from PIL import Image
+
+EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".tiff"}
+DEFAULT_DIR = Path.home() / "Downloads" / "images"
+
+
+def images(d: Path) -> list[Path]:
+    return sorted(p for p in d.iterdir() if p.is_file() and p.suffix.lower() in EXTS)
+
+
+def human(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def cmd_list(d: Path, _a) -> int:
+    files = images(d)
+    if not files:
+        print(f"sin imagenes en {d}")
+        return 1
+    total = 0
+    for p in files:
+        size = p.stat().st_size
+        total += size
+        try:
+            with Image.open(p) as im:
+                print(f"{p.name:<48} {im.width}x{im.height:<10} {im.mode:<6} {human(size)}")
+        except Exception as exc:
+            print(f"{p.name:<48} ILEGIBLE ({type(exc).__name__})")
+    print(f"\n{len(files)} archivo(s), {human(total)}")
+    return 0
+
+
+def cmd_thumbs(d: Path, a) -> int:
+    out = d / "thumbnails"
+    out.mkdir(exist_ok=True)
+    n = 0
+    for p in images(d):
+        if p.parent == out:
+            continue
+        try:
+            with Image.open(p) as im:
+                im = im.convert("RGB") if im.mode in ("P", "RGBA", "LA") else im
+                im.thumbnail((a.size, a.size), Image.LANCZOS)
+                im.save(out / f"{p.stem}.jpg", "JPEG", quality=85)
+                n += 1
+        except Exception as exc:
+            print(f"  fallo {p.name}: {exc}")
+    print(f"{n} miniatura(s) de {a.size}px en {out}")
+    return 0 if n else 1
+
+
+def cmd_sheet(d: Path, a) -> int:
+    files = [p for p in images(d) if p.parent.name != "thumbnails"]
+    if not files:
+        print(f"sin imagenes en {d}")
+        return 1
+    cell, cols, pad = a.cell, a.cols, 4
+    rows = (len(files) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * (cell + pad) + pad, rows * (cell + pad) + pad), "white")
+    for i, p in enumerate(files):
+        try:
+            with Image.open(p) as im:
+                im = im.convert("RGB")
+                im.thumbnail((cell, cell), Image.LANCZOS)
+                x = pad + (i % cols) * (cell + pad) + (cell - im.width) // 2
+                y = pad + (i // cols) * (cell + pad) + (cell - im.height) // 2
+                sheet.paste(im, (x, y))
+        except Exception as exc:
+            print(f"  omitida {p.name}: {exc}")
+    target = d / "contact_sheet.jpg"
+    sheet.save(target, "JPEG", quality=88)
+    print(f"hoja de contacto: {target} ({len(files)} imagenes, {cols} columnas)")
+    return 0
+
+
+def cmd_resize(d: Path, a) -> int:
+    n = 0
+    for p in images(d):
+        try:
+            with Image.open(p) as im:
+                if max(im.size) <= a.max:
+                    continue
+                before = p.stat().st_size
+                im.thumbnail((a.max, a.max), Image.LANCZOS)
+                im.save(p)
+                print(f"  {p.name}: {human(before)} -> {human(p.stat().st_size)}")
+                n += 1
+        except Exception as exc:
+            print(f"  fallo {p.name}: {exc}")
+    print(f"{n} imagen(es) reducida(s) a max {a.max}px")
+    return 0
+
+
+def cmd_convert(d: Path, a) -> int:
+    fmt = a.to.lower()
+    pil_fmt = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP"}.get(fmt)
+    if not pil_fmt:
+        print(f"formato no soportado: {fmt}", file=sys.stderr)
+        return 2
+    n = 0
+    for p in images(d):
+        if p.suffix.lower().lstrip(".") == fmt:
+            continue
+        try:
+            with Image.open(p) as im:
+                if pil_fmt == "JPEG":
+                    im = im.convert("RGB")
+                im.save(p.with_suffix(f".{fmt}"), pil_fmt, quality=88)
+                n += 1
+        except Exception as exc:
+            print(f"  fallo {p.name}: {exc}")
+    print(f"{n} imagen(es) convertida(s) a {fmt}")
+    return 0
+
+
+def cmd_dedupe(d: Path, _a) -> int:
+    by_hash = defaultdict(list)
+    for p in images(d):
+        by_hash[hashlib.sha256(p.read_bytes()).hexdigest()].append(p)
+    dups = {h: ps for h, ps in by_hash.items() if len(ps) > 1}
+    if not dups:
+        print("sin duplicados")
+        return 0
+    waste = 0
+    for ps in dups.values():
+        print(f"duplicado: {ps[0].name}")
+        for extra in ps[1:]:
+            print(f"    == {extra.name}")
+            waste += extra.stat().st_size
+    print(f"\n{len(dups)} grupo(s), {human(waste)} recuperables. Borrado NO automatico: revisa y borra tu.")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Organizar imagenes (Pillow)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    for name in ("list", "thumbs", "sheet", "resize", "convert", "dedupe"):
+        s = sub.add_parser(name)
+        s.add_argument("dir", nargs="?", default=str(DEFAULT_DIR))
+        if name == "thumbs":
+            s.add_argument("--size", type=int, default=200)
+        if name == "sheet":
+            s.add_argument("--cols", type=int, default=4)
+            s.add_argument("--cell", type=int, default=200)
+        if name == "resize":
+            s.add_argument("--max", type=int, default=1920)
+        if name == "convert":
+            s.add_argument("--to", required=True)
+
+    a = ap.parse_args()
+    d = Path(a.dir).expanduser()
+    if not d.is_dir():
+        print(f"no es un directorio: {d}", file=sys.stderr)
+        return 2
+
+    return {
+        "list": cmd_list, "thumbs": cmd_thumbs, "sheet": cmd_sheet,
+        "resize": cmd_resize, "convert": cmd_convert, "dedupe": cmd_dedupe,
+    }[a.cmd](d, a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,16 @@
+# ~/.ssh/config — example (sanitized). Copy to ~/.ssh/config (chmod 600).
+# Real HostName/IP values are private — use Tailscale IPs or placeholders.
+
+Host windows-example
+  HostName 100.x.x.x
+  User your-user
+  IdentityFile ~/.ssh/id_ed25519
+  ForwardAgent yes
+
+Host sahacloud
+  HostName 100.x.x.x
+  User sahacloud
+  Port 22
+  IdentityFile ~/.ssh/id_ed25519
+
+# Never commit known_hosts or authorized_keys

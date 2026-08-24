@@ -1,0 +1,19 @@
+# Secrets — never commit
+*.env
+*.token
+*creds*
+*secret*
+*.db
+auth.json
+hosts.yml
+cloudflared/*.json
+credentials-summary.md
+whatsapp/
+known_hosts
+authorized_keys
+*.log
+.cache/
+.env.preview
+*.key
+*.pem
+secrets/

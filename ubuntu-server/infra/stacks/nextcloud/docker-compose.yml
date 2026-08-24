@@ -1,0 +1,14 @@
+# nextcloud — example stack (placeholder). Adapt from other stacks.
+# Uses ${VAR} from ~/sahacloud-infra/env/nextcloud.env — never hardcode secrets.
+networks:
+  sahacloud-net:
+    external: true
+services:
+  nextcloud:
+    image: REPLACE_WITH_IMAGE:latest
+    container_name: sahacloud-nextcloud
+    restart: unless-stopped
+    env_file:
+      - /home/sahacloud/sahacloud-infra/env/nextcloud.env
+    networks:
+      - sahacloud-net

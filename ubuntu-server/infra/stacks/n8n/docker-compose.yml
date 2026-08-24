@@ -1,0 +1,84 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: n8n-postgres
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 384m
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./volumes/postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  n8n:
+    image: n8nio/n8n:${N8N_IMAGE_TAG}
+    container_name: n8n
+    restart: unless-stopped
+    mem_limit: 1024m
+    memswap_limit: 1536m
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:5678:5678"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: db
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_USER_MANAGEMENT_JWT_SECRET: ${N8N_USER_MANAGEMENT_JWT_SECRET}
+
+      N8N_HOST: ${N8N_HOST}
+      N8N_PROTOCOL: ${N8N_PROTOCOL}
+      N8N_PORT: ${N8N_PORT}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+
+      EXECUTIONS_MODE: ${EXECUTIONS_MODE}
+      EXECUTIONS_DATA_PRUNE: ${EXECUTIONS_DATA_PRUNE}
+      EXECUTIONS_DATA_MAX_AGE: ${EXECUTIONS_DATA_MAX_AGE}
+
+      N8N_METRICS: ${N8N_METRICS}
+      N8N_DIAGNOSTICS_ENABLED: ${N8N_DIAGNOSTICS_ENABLED}
+      N8N_PERSONALIZATION_ENABLED: ${N8N_PERSONALIZATION_ENABLED}
+
+      # Allow the Code node to use Node's built-in crypto module (needed to
+      # sign outbound notifications to Hermes's webhook with HMAC-SHA256).
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto
+      NODE_OPTIONS: "--max-old-space-size=1024"
+    volumes:
+      - ./volumes/n8n_data:/home/node/.n8n
+
+  browserless:
+    image: ghcr.io/browserless/chromium@sha256:9e48bf8df71ba285f974dd9bd9effb59ce8a1e767cfe734b36a24b065ab033f4
+    container_name: n8n-browserless
+    restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 768m
+    # Bound to 127.0.0.1 only (same pattern as n8n) — reachable from other
+    # containers as http://browserless:3000, and from the host itself (e.g.
+    # via an SSH tunnel for one-time interactive login bootstrap) at
+    # 127.0.0.1:3000. Never bind to 0.0.0.0 or expose via Cloudflare: this
+    # is a full remote-controlled browser.
+    ports:
+      - "127.0.0.1:3055:3000"
+    environment:
+      TOKEN: ${BROWSERLESS_TOKEN}
+      CONCURRENT: "1"
+      QUEUED: "2"
+      TIMEOUT: "1800000"
+    volumes:
+      - ./volumes/browserless_data:/tmp/browserless-data-dirs
+    shm_size: "1gb"

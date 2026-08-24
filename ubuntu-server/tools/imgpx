@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""imgpx — pixel art con Pillow. Escalado sin desenfoque, paletas retro, sprites.
+
+La regla del oficio: el pixel art SIEMPRE se escala con NEAREST. Cualquier
+interpolacion suave (LANCZOS/bicubica) mezcla pixeles y arruina el estilo.
+
+    imgpx scale    FOTO --factor 8              ampliar con NEAREST (nitido)
+    imgpx pixelate FOTO --size 64 --colors 16   imagen normal -> pixel art real
+    imgpx palette  FOTO --preset gameboy        forzar paleta historica
+    imgpx alpha    FOTO --key "#00FF00"         quitar fondo por color
+    imgpx sheet    DIR  --cols 4                unir frames en hoja de sprites
+    imgpx split    HOJA --cols 4 --rows 2       separar hoja en frames
+    imgpx info     FOTO                         colores unicos, rejilla detectada
+"""
+import argparse
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+EXTS = {".png", ".gif", ".bmp", ".webp", ".jpg", ".jpeg"}
+
+PALETTES: dict[str, list[str]] = {
+    "gameboy": ["#0f380f", "#306230", "#8bac0f", "#9bbc0f"],
+    "cga":     ["#000000", "#55ffff", "#ff55ff", "#ffffff"],
+    "pico8":   ["#000000", "#1d2b53", "#7e2553", "#008751", "#ab5236", "#5f574f",
+                "#c2c3c7", "#fff1e8", "#ff004d", "#ffa300", "#ffec27", "#00e436",
+                "#29adff", "#83769c", "#ff77a8", "#ffccaa"],
+    "c64":     ["#000000", "#ffffff", "#880000", "#aaffee", "#cc44cc", "#00cc55",
+                "#0000aa", "#eeee77", "#dd8855", "#664400", "#ff7777", "#333333",
+                "#777777", "#aaff66", "#0088ff", "#bbbbbb"],
+    "nes":     ["#000000", "#fcfcfc", "#f8f8f8", "#bcbcbc", "#7c7c7c", "#a4e4fc",
+                "#3cbcfc", "#0078f8", "#0000fc", "#b8b8f8", "#6888fc", "#0058f8",
+                "#d8b8f8", "#9878f8", "#6844fc", "#f8b8f8", "#f878f8", "#d800cc",
+                "#f8a4c0", "#f85898", "#e40058", "#f0d0b0", "#f87858", "#f83800",
+                "#fce0a8", "#fca044", "#e45c10", "#f8d878", "#f8b800", "#ac7c00",
+                "#d8f878", "#b8f818", "#00b800", "#b8f8b8", "#58d854", "#00a800",
+                "#b8f8d8", "#58f898", "#00a844", "#00fcfc", "#00e8d8", "#008888"],
+}
+
+
+def hex_rgb(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore
+
+
+def files_in(p: Path) -> list[Path]:
+    if p.is_dir():
+        return sorted(f for f in p.iterdir() if f.suffix.lower() in EXTS)
+    return [p]
+
+
+def out_name(src: Path, tag: str) -> Path:
+    return src.with_name(f"{src.stem}_{tag}{src.suffix or '.png'}")
+
+
+def cmd_scale(a) -> int:
+    for f in files_in(Path(a.path).expanduser()):
+        im = Image.open(f)
+        big = im.resize((im.width * a.factor, im.height * a.factor), Image.NEAREST)
+        d = out_name(f, f"x{a.factor}")
+        big.save(d)
+        print(f"  {d.name}  {big.width}x{big.height}  (NEAREST, sin desenfoque)")
+    return 0
+
+
+def cmd_pixelate(a) -> int:
+    for f in files_in(Path(a.path).expanduser()):
+        im = Image.open(f).convert("RGB")
+        ratio = im.height / im.width
+        w = a.size
+        h = max(1, int(w * ratio))
+        small = im.resize((w, h), Image.NEAREST)                  # a la rejilla real
+        small = small.quantize(colors=a.colors, method=Image.MEDIANCUT).convert("RGB")
+        d = out_name(f, "px")
+        small.save(d)
+        print(f"  {d.name}  {w}x{h}  {a.colors} colores")
+        print(f"     escalar para ver:  imgpx scale {d.name} --factor 8")
+    return 0
+
+
+def cmd_palette(a) -> int:
+    if a.preset not in PALETTES:
+        print(f"paleta desconocida: {a.preset}. Disponibles: {', '.join(PALETTES)}", file=sys.stderr)
+        return 2
+    colors = [hex_rgb(c) for c in PALETTES[a.preset]]
+
+    pal_img = Image.new("P", (1, 1))
+    flat: list[int] = []
+    for c in colors:
+        flat.extend(c)
+    flat.extend([0, 0, 0] * (256 - len(colors)))
+    pal_img.putpalette(flat)
+
+    for f in files_in(Path(a.path).expanduser()):
+        im = Image.open(f).convert("RGB")
+        q = im.quantize(palette=pal_img, dither=Image.FLOYDSTEINBERG if a.dither else Image.NONE)
+        d = out_name(f, a.preset)
+        q.convert("RGB").save(d)
+        print(f"  {d.name}  paleta {a.preset} ({len(colors)} colores)"
+              f"{', dithering' if a.dither else ''}")
+    return 0
+
+
+def cmd_alpha(a) -> int:
+    key = hex_rgb(a.key)
+    for f in files_in(Path(a.path).expanduser()):
+        im = Image.open(f).convert("RGBA")
+        px = im.load()
+        n = 0
+        for y in range(im.height):
+            for x in range(im.width):
+                r, g, b, _ = px[x, y]
+                if abs(r - key[0]) <= a.tol and abs(g - key[1]) <= a.tol and abs(b - key[2]) <= a.tol:
+                    px[x, y] = (0, 0, 0, 0)
+                    n += 1
+        d = out_name(f, "alpha").with_suffix(".png")
+        im.save(d)
+        print(f"  {d.name}  {n:,} pixeles transparentes")
+    return 0
+
+
+def cmd_sheet(a) -> int:
+    d = Path(a.path).expanduser()
+    frames = files_in(d)
+    if not frames:
+        print(f"sin frames en {d}", file=sys.stderr)
+        return 1
+    ims = [Image.open(f).convert("RGBA") for f in frames]
+    cw, ch = max(i.width for i in ims), max(i.height for i in ims)
+    cols = a.cols
+    rows = (len(ims) + cols - 1) // cols
+    sheet = Image.new("RGBA", (cols * cw, rows * ch), (0, 0, 0, 0))
+    for i, im in enumerate(ims):
+        sheet.paste(im, ((i % cols) * cw, (i // cols) * ch), im)
+    target = d / "spritesheet.png"
+    sheet.save(target)
+    print(f"  {target}  {sheet.width}x{sheet.height}  {len(ims)} frames, celda {cw}x{ch}")
+    return 0
+
+
+def cmd_split(a) -> int:
+    src = Path(a.path).expanduser()
+    im = Image.open(src).convert("RGBA")
+    cw, ch = im.width // a.cols, im.height // a.rows
+    out = src.parent / f"{src.stem}_frames"
+    out.mkdir(exist_ok=True)
+    n = 0
+    for r in range(a.rows):
+        for c in range(a.cols):
+            im.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch)).save(out / f"frame_{n:03d}.png")
+            n += 1
+    print(f"  {n} frames de {cw}x{ch} en {out}")
+    return 0
+
+
+def cmd_info(a) -> int:
+    for f in files_in(Path(a.path).expanduser()):
+        im = Image.open(f).convert("RGB")
+        # getcolors() devuelve None si se pasa de maxcolors; getdata() esta
+        # deprecado en Pillow 12 y desaparece en Pillow 14.
+        found = im.getcolors(maxcolors=65536)
+        uniq = len(found) if found is not None else 65536
+        mostrado = f"{uniq:,}" if found is not None else ">65.536"
+        print(f"{f.name}: {im.width}x{im.height}, {mostrado} colores unicos")
+        if uniq > 256:
+            print(f"   NO es pixel art real ({mostrado} colores). Cuantiza:")
+            print(f"   imgpx pixelate {f.name} --size 64 --colors 16")
+        else:
+            print("   paleta compatible con pixel art")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Pixel art (Pillow)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("scale", "pixelate", "palette", "alpha", "sheet", "split", "info"):
+        s = sub.add_parser(name)
+        s.add_argument("path")
+        if name == "scale":
+            s.add_argument("--factor", type=int, default=8)
+        if name == "pixelate":
+            s.add_argument("--size", type=int, default=64)
+            s.add_argument("--colors", type=int, default=16)
+        if name == "palette":
+            s.add_argument("--preset", required=True, choices=sorted(PALETTES))
+            s.add_argument("--dither", action="store_true")
+        if name == "alpha":
+            s.add_argument("--key", default="#00FF00")
+            s.add_argument("--tol", type=int, default=40)
+        if name in ("sheet", "split"):
+            s.add_argument("--cols", type=int, default=4)
+        if name == "split":
+            s.add_argument("--rows", type=int, default=1)
+
+    a = ap.parse_args()
+    return {
+        "scale": cmd_scale, "pixelate": cmd_pixelate, "palette": cmd_palette,
+        "alpha": cmd_alpha, "sheet": cmd_sheet, "split": cmd_split, "info": cmd_info,
+    }[a.cmd](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,112 @@
+networks:
+  sahacloud-net:
+    external: true
+
+services:
+    postgres:
+        image: ghcr.io/aliasvault/postgres:latest
+        container_name: sahacloud-aliasvault-postgres
+        mem_limit: 384m
+        memswap_limit: 512m
+        volumes:
+            - /opt/sahacloud/data/aliasvault/database/postgres:/var/lib/postgresql/data:rw
+            - ./secrets:/secrets:ro
+        env_file:
+            - .env
+        restart: unless-stopped
+        environment:
+            POSTGRES_DB: aliasvault
+            POSTGRES_USER: aliasvault
+            POSTGRES_PASSWORD_FILE: /secrets/postgres_password
+        networks:
+            - sahacloud-net
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U aliasvault"]
+            interval: 5s
+            timeout: 5s
+            retries: 5
+            start_period: 10s
+
+    client:
+        image: ghcr.io/aliasvault/client:latest
+        container_name: sahacloud-aliasvault-client
+        mem_limit: 128m
+        memswap_limit: 192m
+        volumes:
+            - /opt/sahacloud/data/aliasvault/logs/msbuild:/apps/server/msbuild-logs:rw
+        expose:
+            - "3000"
+        restart: unless-stopped
+        env_file:
+            - .env
+        networks:
+            - sahacloud-net
+
+    api:
+        image: ghcr.io/aliasvault/api:latest
+        container_name: sahacloud-aliasvault-api
+        mem_limit: 256m
+        memswap_limit: 384m
+        expose:
+            - "3001"
+        volumes:
+            - /opt/sahacloud/data/aliasvault/database:/database:rw
+            - /opt/sahacloud/data/aliasvault/logs:/logs:rw
+            - ./secrets:/secrets:ro
+        restart: unless-stopped
+        env_file:
+            - .env
+        networks:
+            - sahacloud-net
+        depends_on:
+            postgres:
+                condition: service_healthy
+
+    admin:
+        image: ghcr.io/aliasvault/admin:latest
+        container_name: sahacloud-aliasvault-admin
+        mem_limit: 256m
+        memswap_limit: 384m
+        expose:
+            - "3002"
+        volumes:
+            - /opt/sahacloud/data/aliasvault/database:/database:rw
+            - /opt/sahacloud/data/aliasvault/logs:/logs:rw
+            - ./secrets:/secrets:ro
+        restart: unless-stopped
+        env_file:
+            - .env
+        networks:
+            - sahacloud-net
+        depends_on:
+            postgres:
+                condition: service_healthy
+
+    task-runner:
+        image: ghcr.io/aliasvault/task-runner:latest
+        container_name: sahacloud-aliasvault-task-runner
+        mem_limit: 256m
+        memswap_limit: 384m
+        volumes:
+            - /opt/sahacloud/data/aliasvault/database:/database:rw
+            - /opt/sahacloud/data/aliasvault/logs:/logs:rw
+            - ./secrets:/secrets:ro
+        restart: unless-stopped
+        env_file:
+            - .env
+        networks:
+            - sahacloud-net
+        depends_on:
+            postgres:
+                condition: service_healthy
+
+# ── Intentionally excluded from this deployment ─────────────────────────────
+# reverse-proxy: AliasVault's bundled nginx + Let's Encrypt. Redundant with
+#   Caddy + Cloudflare Tunnel, which already terminate TLS for every other
+#   service on this host. Caddy proxies to client/api/admin directly instead
+#   (see sahacloud-infra/caddy/Caddyfile, vault.sahacloud.dpdns.org block).
+# smtp: private email-alias receiving. Requires a dedicated domain with MX
+#   records pointing at this server's public IP and inbound port 25 reachable
+#   — fundamentally incompatible with Cloudflare Tunnel (HTTP/S only). Left
+#   out entirely so no unused port-25 listener exists. PRIVATE_EMAIL_DOMAINS
+#   stays empty in .env, which natively disables the alias-email feature.

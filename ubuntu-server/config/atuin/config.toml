@@ -1,0 +1,8 @@
+# Sin sync en la nube — solo local
+auto_sync = false
+sync_frequency = "0"
+update_check = false
+style = "compact"
+inline_height = 20
+show_preview = true
+history_filter = []

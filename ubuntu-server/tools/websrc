@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""websrc — extractor unificado de fuentes web con salida normalizada.
+
+Detecta el tipo de fuente, elige el metodo correcto, normaliza los metadatos a
+un esquema unico y registra el resultado. Deduplica por URL, reintenta con
+espera exponencial y no revienta si una fuente falla.
+
+    websrc fetch URL [URL...]        extraer y normalizar
+    websrc fetch URL --media         ademas descargar la media
+    websrc batch archivo.txt         una URL por linea
+    websrc show URL                  ver lo ya extraido (cache)
+    websrc list [--limit 20]         que hay en el almacen
+    websrc errors                    ultimos fallos registrados
+
+Almacen: ~/.hermes/websrc/   (items/<hash>.json, media/, errors.log)
+Esquema de salida identico para toda fuente: asi el agente no adivina.
+"""
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+STORE = Path.home() / ".hermes" / "websrc"
+ITEMS, MEDIA = STORE / "items", STORE / "media"
+ERRLOG = STORE / "errors.log"
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def ahora() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def uid(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def log_error(url: str, etapa: str, exc: object) -> None:
+    STORE.mkdir(parents=True, exist_ok=True)
+    with ERRLOG.open("a", encoding="utf-8") as fh:
+        fh.write(f"{ahora()}\t{etapa}\t{url}\t{type(exc).__name__}: {exc}\n")
+
+
+def clasificar(url: str) -> str:
+    h = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if h in ("reddit.com", "old.reddit.com", "redd.it", "i.redd.it", "v.redd.it"):
+        return "reddit"
+    if h in ("x.com", "twitter.com", "mobile.twitter.com", "nitter.net"):
+        return "x"
+    if h in ("youtube.com", "youtu.be"):
+        return "youtube"
+    return "web"
+
+
+def http_get(url: str, intentos: int = 3, timeout: int = 25) -> str:
+    """GET con reintento y espera exponencial. 4xx no se reintenta (salvo 429)."""
+    ultimo: Exception | None = None
+    for i in range(intentos):
+        try:
+            req = Request(url, headers={"User-Agent": UA, "Accept-Language": "es,en;q=0.8"})
+            with urlopen(req, timeout=timeout) as r:
+                cs = r.headers.get_content_charset() or "utf-8"
+                return r.read().decode(cs, "replace")
+        except HTTPError as e:
+            ultimo = e
+            if e.code == 429:                       # rate limit: respeta Retry-After
+                espera = int(e.headers.get("Retry-After") or (2 ** i * 5))
+                print(f"    429 rate limit, esperando {espera}s", file=sys.stderr)
+                time.sleep(min(espera, 60))
+                continue
+            if 400 <= e.code < 500:                 # 403/404: reintentar no arregla nada
+                raise
+        except (URLError, TimeoutError, OSError) as e:
+            ultimo = e
+        if i < intentos - 1:
+            time.sleep(2 ** i)
+    raise ultimo or RuntimeError("fallo desconocido")
+
+
+class MetaParser(HTMLParser):
+    """Open Graph + Twitter Cards + <title>. Cubre la mayoria de sitios."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.meta: dict[str, str] = {}
+        self.title = ""
+        self.ldjson: list[str] = []
+        self._en_title = False
+        self._en_ld = False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "meta":
+            k = a.get("property") or a.get("name") or ""
+            v = a.get("content") or ""
+            if k and v and (k.startswith(("og:", "twitter:", "article:")) or
+                            k in ("description", "author", "keywords")):
+                self.meta[k] = v
+        elif tag == "title":
+            self._en_title = True
+        elif tag == "script" and a.get("type") == "application/ld+json":
+            self._en_ld = True
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._en_title = False
+        elif tag == "script":
+            self._en_ld = False
+
+    def handle_data(self, data):
+        if self._en_title and not self.title:
+            self.title = data.strip()
+        elif self._en_ld:
+            self.ldjson.append(data)
+
+
+def base_item(url: str, tipo: str) -> dict:
+    return {
+        "url": url, "fuente": tipo, "extraido_en": ahora(), "metodo": "",
+        "titulo": None, "autor": None, "fecha": None, "texto": None,
+        "metricas": {}, "media": [], "enlaces": [], "comentarios": [],
+        "permalink": url, "extra": {},
+    }
+
+
+def extraer_web(url: str) -> dict:
+    it = base_item(url, clasificar(url))
+    it["metodo"] = "http+opengraph"
+    html = http_get(url)
+    p = MetaParser()
+    p.feed(html)
+    m = p.meta
+
+    it["titulo"] = m.get("og:title") or p.title or None
+    it["texto"] = m.get("og:description") or m.get("description")
+    it["autor"] = m.get("article:author") or m.get("author") or m.get("twitter:creator")
+    it["fecha"] = m.get("article:published_time")
+    it["permalink"] = m.get("og:url") or url
+
+    for k in ("og:image", "twitter:image", "og:image:secure_url"):
+        if m.get(k):
+            it["media"].append({"tipo": "imagen", "url": m[k], "origen": k})
+    if m.get("og:video"):
+        it["media"].append({"tipo": "video", "url": m["og:video"], "origen": "og:video"})
+
+    for raw in p.ldjson:                             # JSON-LD aporta autor/fecha fiables
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        for o in (d if isinstance(d, list) else [d]):
+            if not isinstance(o, dict):
+                continue
+            it["fecha"] = it["fecha"] or o.get("datePublished")
+            a = o.get("author")
+            if isinstance(a, dict):
+                it["autor"] = it["autor"] or a.get("name")
+            elif isinstance(a, str):
+                it["autor"] = it["autor"] or a
+
+    it["enlaces"] = sorted(set(re.findall(r'href="(https?://[^"]{10,300})"', html)))[:40]
+    return it
+
+
+def extraer_reddit(url: str) -> dict:
+    """PRAW si hay credenciales; si no, avisa. El JSON anonimo devuelve 403."""
+    it = base_item(url, "reddit")
+    creds = leer_env(["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"])
+    if not all(creds.get(k) for k in ("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET")):
+        it["metodo"] = "no-disponible"
+        it["extra"]["aviso"] = (
+            "Faltan REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET en ~/.hermes/.env. "
+            "El endpoint .json anonimo de Reddit devuelve 403 desde el cierre de su API. "
+            "Registra una app tipo 'script' en https://www.reddit.com/prefs/apps")
+        return it
+
+    import praw                                       # noqa: PLC0415  (solo si hay creds)
+    r = praw.Reddit(client_id=creds["REDDIT_CLIENT_ID"],
+                    client_secret=creds["REDDIT_CLIENT_SECRET"],
+                    user_agent=creds.get("REDDIT_USER_AGENT") or "hermes/1.0")
+    r.read_only = True
+    it["metodo"] = "praw"
+
+    post = r.submission(url=url)
+    it["titulo"] = post.title
+    it["autor"] = str(post.author) if post.author else "[borrado]"
+    it["fecha"] = datetime.fromtimestamp(post.created_utc, timezone.utc).isoformat()
+    it["texto"] = post.selftext or None
+    it["permalink"] = f"https://www.reddit.com{post.permalink}"
+    it["metricas"] = {"score": post.score, "ratio_votos": post.upvote_ratio,
+                      "comentarios": post.num_comments}
+    it["extra"]["subreddit"] = str(post.subreddit)
+    it["extra"]["nsfw"] = post.over_18
+
+    if getattr(post, "is_video", False) and post.media:
+        v = (post.media or {}).get("reddit_video", {})
+        if v.get("fallback_url"):
+            it["media"].append({"tipo": "video", "url": v["fallback_url"], "origen": "reddit_video"})
+    elif post.url and re.search(r"\.(jpg|jpeg|png|gif|webp)$", post.url, re.I):
+        it["media"].append({"tipo": "imagen", "url": post.url, "origen": "post.url"})
+    elif getattr(post, "is_gallery", False):
+        for g in (post.media_metadata or {}).values():
+            if g.get("s", {}).get("u"):
+                it["media"].append({"tipo": "imagen",
+                                    "url": g["s"]["u"].replace("&amp;", "&"),
+                                    "origen": "galeria"})
+    if post.url and not post.is_self:
+        it["enlaces"].append(post.url)
+
+    post.comments.replace_more(limit=0)               # sin expandir "cargar mas"
+    for c in post.comments[:15]:
+        it["comentarios"].append({"autor": str(c.author) if c.author else "[borrado]",
+                                  "score": c.score, "texto": (c.body or "")[:600]})
+        it["enlaces"] += re.findall(r"https?://[^\s\)\]]+", c.body or "")[:3]
+
+    it["enlaces"] = sorted(set(it["enlaces"]))[:40]
+    return it
+
+
+def extraer_x(url: str) -> dict:
+    """X exige sesion para casi todo. Se intenta OpenGraph y se anota el limite."""
+    it = base_item(url, "x")
+    it["metodo"] = "http+opengraph"
+    try:
+        it = {**extraer_web(url), "fuente": "x"}
+    except HTTPError as e:
+        it["extra"]["http_error"] = e.code
+    if not it.get("texto") and not it.get("titulo"):
+        it["extra"]["aviso"] = (
+            "X no sirve contenido a clientes sin sesion. Vias que si funcionan: "
+            "(1) `xurl` con la API oficial de X (skill /xurl); "
+            "(2) `yt-dlp` para media de posts publicos; "
+            "(3) navegador con sesion via Playwright MCP. Ver skill /x-lector.")
+    return it
+
+
+def leer_env(claves: list[str]) -> dict[str, str]:
+    p = Path.home() / ".hermes" / ".env"
+    out: dict[str, str] = {}
+    if not p.exists():
+        return out
+    for linea in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        linea = linea.strip()
+        if not linea or linea.startswith("#") or "=" not in linea:
+            continue
+        k, v = linea.split("=", 1)
+        if k.strip() in claves:
+            out[k.strip()] = v.strip().strip("'\"")
+    return out
+
+
+def bajar_media(it: dict) -> None:
+    """yt-dlp para video (sabe de Reddit y X); descarga directa para imagen."""
+    MEDIA.mkdir(parents=True, exist_ok=True)
+    destino = MEDIA / uid(it["url"])
+    destino.mkdir(exist_ok=True)
+
+    tiene_video = any(m["tipo"] == "video" for m in it["media"])
+    if tiene_video or it["fuente"] in ("reddit", "x", "youtube"):
+        try:
+            r = subprocess.run(
+                ["yt-dlp", "--no-warnings", "--no-playlist", "-o",
+                 str(destino / "%(title).80s.%(ext)s"), it["url"]],
+                capture_output=True, text=True, timeout=300)
+            if r.returncode == 0:
+                for f in destino.iterdir():
+                    it["extra"].setdefault("descargados", []).append(str(f))
+                    print(f"    video: {f.name}")
+            else:
+                nota = (r.stderr or "").strip().splitlines()[-1:] or ["sin detalle"]
+                it["extra"]["yt_dlp"] = nota[0][:200]
+        except Exception as e:
+            log_error(it["url"], "yt-dlp", e)
+            it["extra"]["yt_dlp"] = f"{type(e).__name__}: {e}"
+
+    for m in it["media"]:
+        if m["tipo"] != "imagen":
+            continue
+        try:
+            req = Request(m["url"], headers={"User-Agent": UA})
+            with urlopen(req, timeout=30) as r:
+                ct = (r.headers.get("Content-Type") or "").split(";")[0]
+                if not ct.startswith("image/"):
+                    continue
+                data = r.read()
+            ext = {"image/jpeg": ".jpg", "image/png": ".png",
+                   "image/gif": ".gif", "image/webp": ".webp"}.get(ct, ".bin")
+            f = destino / f"img_{hashlib.sha256(data).hexdigest()[:8]}{ext}"
+            f.write_bytes(data)
+            m["local"] = str(f)
+            print(f"    imagen: {f.name} ({len(data):,} B)")
+        except Exception as e:
+            log_error(m["url"], "imagen", e)
+
+
+def guardar(it: dict) -> Path:
+    ITEMS.mkdir(parents=True, exist_ok=True)
+    p = ITEMS / f"{uid(it['url'])}.json"
+    p.write_text(json.dumps(it, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def resumen(it: dict) -> None:
+    print(f"  fuente   : {it['fuente']}  (metodo: {it['metodo']})")
+    print(f"  titulo   : {(it.get('titulo') or '-')[:100]}")
+    print(f"  autor    : {it.get('autor') or '-'}   fecha: {it.get('fecha') or '-'}")
+    if it.get("metricas"):
+        print(f"  metricas : {it['metricas']}")
+    if it.get("extra", {}).get("subreddit"):
+        print(f"  subreddit: r/{it['extra']['subreddit']}")
+    print(f"  media    : {len(it['media'])}   comentarios: {len(it['comentarios'])}"
+          f"   enlaces: {len(it['enlaces'])}")
+    print(f"  PERMALINK: {it['permalink']}")
+    if it.get("extra", {}).get("aviso"):
+        print(f"  AVISO    : {it['extra']['aviso']}")
+
+
+def cmd_fetch(a) -> int:
+    urls = a.urls
+    fallos = 0
+    for u in urls:
+        print(f"\n[{clasificar(u)}] {u}")
+        cache = ITEMS / f"{uid(u)}.json"
+        if cache.exists() and not a.force:
+            print("  (ya extraido; --force para rehacer)")
+            resumen(json.loads(cache.read_text(encoding="utf-8")))
+            continue
+        try:
+            tipo = clasificar(u)
+            it = {"reddit": extraer_reddit, "x": extraer_x}.get(tipo, extraer_web)(u)
+            if a.media:
+                bajar_media(it)
+            guardar(it)
+            resumen(it)
+        except Exception as e:
+            log_error(u, "fetch", e)
+            print(f"  FALLO: {type(e).__name__}: {e}", file=sys.stderr)
+            fallos += 1
+    print(f"\n{len(urls)} URL(s), {fallos} fallo(s). Almacen: {ITEMS}")
+    return 1 if fallos == len(urls) else 0
+
+
+def cmd_batch(a) -> int:
+    p = Path(a.archivo).expanduser()
+    urls = [l.strip() for l in p.read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.startswith("#")]
+    a.urls = urls
+    return cmd_fetch(a)
+
+
+def cmd_show(a) -> int:
+    p = ITEMS / f"{uid(a.url)}.json"
+    if not p.exists():
+        print(f"no extraido aun: {a.url}", file=sys.stderr)
+        return 1
+    print(p.read_text(encoding="utf-8"))
+    return 0
+
+
+def cmd_list(a) -> int:
+    if not ITEMS.exists():
+        print("almacen vacio")
+        return 0
+    fs = sorted(ITEMS.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    for f in fs[:a.limit]:
+        d = json.loads(f.read_text(encoding="utf-8"))
+        print(f"{d['fuente']:<8} {(d.get('titulo') or '-')[:58]:<58} {d['permalink'][:60]}")
+    print(f"\n{len(fs)} item(s) en {ITEMS}")
+    return 0
+
+
+def cmd_errors(_a) -> int:
+    if not ERRLOG.exists():
+        print("sin errores registrados")
+        return 0
+    print("".join(ERRLOG.read_text(encoding="utf-8").splitlines(keepends=True)[-25:]))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Extractor unificado de fuentes web")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    f = sub.add_parser("fetch"); f.add_argument("urls", nargs="+")
+    f.add_argument("--media", action="store_true"); f.add_argument("--force", action="store_true")
+    b = sub.add_parser("batch"); b.add_argument("archivo")
+    b.add_argument("--media", action="store_true"); b.add_argument("--force", action="store_true")
+    s = sub.add_parser("show"); s.add_argument("url")
+    l = sub.add_parser("list"); l.add_argument("--limit", type=int, default=20)
+    sub.add_parser("errors")
+
+    a = ap.parse_args()
+    return {"fetch": cmd_fetch, "batch": cmd_batch, "show": cmd_show,
+            "list": cmd_list, "errors": cmd_errors}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

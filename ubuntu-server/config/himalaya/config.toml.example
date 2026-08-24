@@ -1,0 +1,17 @@
+# himalaya config — example (sanitized)
+# See https://pimalaya.org/himalaya/
+# Store real credentials via `himalaya account configure` or sops — never commit.
+display-name = "Your Name"
+downloads-dir = "~/Downloads"
+
+[accounts.my-account]
+default = true
+email = "you@example.com"
+display-name = "Your Name"
+
+backend = "imap"
+imap-host = "imap.example.com"
+imap-port = 993
+imap-encryption = "tls"
+imap-login = "you@example.com"
+# imap-passwd-cmd = "pass show email/imap"  # use password manager command, not plaintext

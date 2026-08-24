@@ -1,0 +1,108 @@
+# ~/.zshrc — example (sanitized). Copy to ~/.zshrc and fill YOUR_*_KEY.
+# Requires: oh-my-zsh, powerlevel10k, atuin, zoxide, eza, batcat, duf, fzf
+
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.opencode/bin:$PATH"
+export EDITOR="nano"
+
+# --- API keys (REPLACE placeholders, never commit real values) ---
+export NVIDIA_API_KEY="YOUR_NVIDIA_API_KEY"   # nvapi-* from https://build.nvidia.com
+export OPENAI_API_KEY="$NVIDIA_API_KEY"       # or YOUR_OPENAI_API_KEY (sk-...)
+export OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
+export GRAPHIFY_OPENAI_MODEL="mistralai/mistral-medium-3.5-128b"
+export OMNIROUTE_API_KEY="YOUR_OMNIROUTE_API_KEY"  # sk-* for OmniRoute/OpenRouter proxy
+
+export ZSH="$HOME/.oh-my-zsh"
+ZSH_THEME="powerlevel10k/powerlevel10k"
+
+plugins=(
+  git
+  sudo
+  zsh-autosuggestions
+  zsh-syntax-highlighting
+  zsh-completions
+  fzf
+)
+
+source $ZSH/oh-my-zsh.sh
+
+if command -v zoxide >/dev/null 2>&1; then
+  eval "$(zoxide init zsh)"
+fi
+
+export ATUIN_NOBIND=true
+if [ -f "$HOME/.atuin/bin/env" ]; then
+  source "$HOME/.atuin/bin/env"
+fi
+if command -v atuin >/dev/null 2>&1; then
+  eval "$(atuin init zsh --disable-up-arrow)"
+  bindkey '^r' atuin-search
+  bindkey '^[[A' atuin-up-search
+  bindkey '^[OA' atuin-up-search
+  bindkey '^[[B' down-line-or-search
+  bindkey '^[OB' down-line-or-search
+fi
+
+alias ls='eza --icons --color=always --group-directories-first'
+alias ll='eza -la --icons --color=always --group-directories-first'
+alias la='eza -a --icons --color=always --group-directories-first'
+alias lt='eza --tree --level=2 --icons --color=always'
+alias cat='batcat --style=numbers --color=always'
+alias df='duf'
+alias top='btop'
+alias oc='opencode'
+alias reload='exec zsh'
+
+HISTSIZE=50000
+SAVEHIST=50000
+setopt HIST_IGNORE_DUPS
+setopt HIST_IGNORE_ALL_DUPS
+setopt SHARE_HISTORY
+setopt AUTO_CD
+setopt NO_BEEP
+
+status() {
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  RAM:  $(free -h | awk '/Mem:/{print $3 "/" $2}')"
+  echo "  Disk: $(df / | tail -1 | awk '{print $3 "/" $2 " (" $5 ")"}')"
+  echo "  IP:   $(hostname -I | awk '{print $1}')"
+  echo "  Up:   $(uptime -p)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
+
+__wezterm_status() {
+  printf '\e]7;file://%s%s\e\\' "$HOST" "$PWD"
+  local branch=""
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    branch="$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)"
+    [ -n "$(git status --porcelain 2>/dev/null)" ] && branch="${branch}*"
+  fi
+  printf '\e]1337;SetUserVar=git_branch=%s\e\\' "$(printf '%s' "$branch" | base64 | tr -d '\n')"
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd __wezterm_status
+
+zmodload zsh/datetime
+typeset -ga NOTIFY_CLI_CMDS=(claude opencode aider cursor cline code ollama oc)
+typeset -g __notify_cmd=""
+typeset -g __notify_start=0
+__notify_preexec() { __notify_cmd="${1%% *}"; __notify_start=$EPOCHSECONDS; }
+__notify_precmd() {
+  local elapsed=$(( EPOCHSSECONDS - __notify_start ))
+  if [ -n "$__notify_cmd" ]; then
+    local base="${__notify_cmd##*/}"
+    if (( elapsed >= 8 )) || (( ${NOTIFY_CLI_CMDS[(Ie)$base]} )); then
+      printf '\a'
+      [ -n "$TMUX" ] && tmux display-message -d 2000 "✓ ${base} finished (${elapsed}s)" 2>/dev/null
+    fi
+  fi
+  __notify_cmd=""; __notify_start=0
+}
+add-zsh-hook preexec __notify_preexec
+add-zsh-hook precmd __notify_precmd
+
+export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.kimi-code/bin:$PATH"

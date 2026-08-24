@@ -1,0 +1,14 @@
+# outline — example stack (placeholder). Adapt from other stacks.
+# Uses ${VAR} from ~/sahacloud-infra/env/outline.env — never hardcode secrets.
+networks:
+  sahacloud-net:
+    external: true
+services:
+  outline:
+    image: REPLACE_WITH_IMAGE:latest
+    container_name: sahacloud-outline
+    restart: unless-stopped
+    env_file:
+      - /home/sahacloud/sahacloud-infra/env/outline.env
+    networks:
+      - sahacloud-net

@@ -195,7 +195,7 @@ install_ubuntu_server() {
   echo "==> skills/ (hermes + opencode — docs only, no secrets)"
   if [ -d "$SRC/skills/hermes" ]; then
     mkdir -p "$HOME/.hermes/skills" "$HOME/.config/opencode/skills"
-    echo "  hermes skills available in $SRC/skills/hermes/ (47) — copy manually if needed:"
+    echo "  hermes skills available in $SRC/skills/hermes/ (192) — copy manually if needed:"
     echo "    cp -r $SRC/skills/hermes/* ~/.hermes/skills/"
     echo "  opencode skills in $SRC/skills/opencode/ (23):"
     echo "    cp -r $SRC/skills/opencode/* ~/.config/opencode/skills/"

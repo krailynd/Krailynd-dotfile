@@ -1,7 +1,7 @@
 # Alias SSH para acceso rápido a la máquina SahaCloud (YOUR_TAILSCALE_IP)
 Host sahacloud
     HostName YOUR_TAILSCALE_IP
-    User sahacloud
+    User YOUR_SERVER_USER
     # Copy your own private key to ~/.ssh/ and point IdentityFile at it.
     # NEVER commit private keys — generate/transfer them out-of-band.
     IdentityFile ~/.ssh/YOUR_PRIVATE_KEY

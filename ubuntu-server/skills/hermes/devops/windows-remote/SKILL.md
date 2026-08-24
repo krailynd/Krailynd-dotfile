@@ -34,7 +34,7 @@ No usar para: operaciones en el Linux server (usa las tools nativas), ni para Bl
 | Host | `YOUR_HOSTNAME` |
 | Usuario | `krailynd` |
 | IP Tailscale | `YOUR_TAILSCALE_IP` |
-| IP LAN | `192.168.0.4` |
+| IP LAN | `YOUR_LAN_IP` |
 | SO | Windows 11 Enterprise v10.0.26200 |
 | Puerto SSH | 22 (OpenSSH for Windows) |
 | Alias config | `windows-krai` (en `~/.ssh/config`) |

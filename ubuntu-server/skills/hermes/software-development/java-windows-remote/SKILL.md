@@ -38,7 +38,7 @@ destino del deploy.
 
 ```
 Host windows-krai
-    HostName YOUR_TAILSCALE_IP          # Tailscale; LAN fallback 192.168.0.4
+    HostName YOUR_TAILSCALE_IP          # Tailscale; LAN fallback YOUR_LAN_IP
     User krailynd
     IdentityFile ~/.ssh/YOUR_WIN_SSH_KEY
     RequestTTY yes

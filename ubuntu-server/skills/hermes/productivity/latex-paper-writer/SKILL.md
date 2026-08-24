@@ -36,7 +36,7 @@ Proyecto_LaTeX/
 \usepackage{cite}
 
 \title{Título del Libro o Tesis}
-\author{YOUR_NAME "Krailynd" YOUR_NAME}
+\author{YOUR_NAME "Krailynd"}
 \date{\today}
 
 \begin{document}

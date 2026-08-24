@@ -1,11 +1,11 @@
 # Krailynd: WhatsApp Reminders Configuration
 
 ## Overview
-Krailynd (YOUR_NAME YOUR_NAME) requires reliable WhatsApp-based reminders for time-sensitive tasks. This document captures the workflow, pitfalls, and verified methods for scheduling and delivering reminders to Krailynd's WhatsApp number (+YOUR_WHATSAPP_NUMBER).
+Krailynd (YOUR_NAME) requires reliable WhatsApp-based reminders for time-sensitive tasks. This document captures the workflow, pitfalls, and verified methods for scheduling and delivering reminders to Krailynd's WhatsApp number (YOUR_WHATSAPP_NUMBER).
 
 ## Current Status
 - **Primary delivery channel**: WhatsApp (via Hermes gateway bridge)
-- **Number**: +YOUR_WHATSAPP_NUMBER (Peru, UTC-5)
+- **Number**: YOUR_WHATSAPP_NUMBER (Peru, UTC-5)
 - **Gateway status**: Active and running (`hermes-gateway.service`)
 - **Bridge endpoint**: `127.0.0.1:3000` (WhatsApp Web-based)
 

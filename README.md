@@ -12,6 +12,8 @@ Krailynd-dotfile/
 │   ├── tmux/        # tmux.conf
 │   ├── config/      # btop, opencode, gh, ssh, atuin, himalaya
 │   ├── tools/       # hermes-* bridges and helpers
+│   ├── skills/      # 215 skills (192 hermes + 23 opencode), sanitized — see skills/README.md
+│   ├── mcp/         # MCP servers (codegraph, engram) — opencode.json.example sanitized
 │   ├── infra/       # Caddy, Docker Compose stacks, scripts, env templates
 │   └── docs/        # SECURITY, STUDENT-GUIDE
 └── ubuntu-server/proyectos/_template  # new project scaffold

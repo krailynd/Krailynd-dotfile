@@ -1,0 +1,28 @@
+// OpenCode MCP example — sanitized, no secrets
+// Copy to ~/.config/opencode/opencode.json and adjust paths
+{
+  "$schema": "https://opencode.ai/config.json",
+  // MCP servers: local (spawn command) or remote (HTTP)
+  "mcp": {
+    // CodeGraph — codebase knowledge graph (symbols, calls, impact)
+    // Requires: codegraph binary on PATH
+    "codegraph": {
+      "type": "local",
+      "command": ["codegraph", "serve", "--mcp"],
+      "enabled": true
+    },
+    // Engram — persistent memory across sessions
+    // Requires: engram binary; use absolute path if not on PATH
+    "engram": {
+      "type": "local",
+      "command": ["engram", "mcp", "--tools=agent"],
+      "enabled": true
+    }
+    // Optional: Context7 for live library docs (remote, no token needed)
+    // "context7": {
+    //   "type": "remote",
+    //   "url": "https://mcp.context7.com/mcp",
+    //   "enabled": true
+    // }
+  }
+}

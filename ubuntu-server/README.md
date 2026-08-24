@@ -10,6 +10,8 @@ Sanitized configs from the SahaCloud Ubuntu Server (VirtualBox + Docker + Caddy 
 | `tmux/` | terminal multiplexer config |
 | `config/` | btop, opencode, gh, ssh, atuin, himalaya — app configs |
 | `tools/` | hermes-* bridges and helper scripts |
+| `skills/` | 215 skills (192 Hermes + 23 OpenCode), sanitized — `hermes/` by category, `opencode/` flat; see `skills/README.md` |
+| `mcp/` | MCP servers (`codegraph`, `engram`) — `opencode.json.example` sanitized, no tokens; see `mcp/README.md` |
 | `infra/` | Caddy, Docker Compose stacks, health/update/preview scripts, env templates |
 | `docs/` | SECURITY and STUDENT-GUIDE |
 | `proyectos/_template/` | minimal new-project scaffold |

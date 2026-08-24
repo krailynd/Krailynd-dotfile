@@ -1,0 +1,11 @@
+{
+  "mcpPath": "${HOME}/.pi/agent/mcp.json",
+  "mcp": {
+    "before": "{\n  \"mcpServers\": {\n    \"context7\": {\n      \"args\": [\n        \"-y\",\n        \"--package=@upstash/context7-mcp@2.2.5\",\n        \"--\",\n        \"context7-mcp\"\n      ],\n      \"command\": \"npx\"\n    },\n    \"engram\": {\n      \"command\": \"node\",\n      \"args\": [\n        \"-e\",\n        \"const { spawn } = require('node:child_process'); const bin = process.env.ENGRAM_BIN || 'engram'; const child = spawn(bin, ['mcp', '--tools=agent'], { stdio: 'inherit' }); child.on('error', () =\u003e process.exit(127)); child.on('exit', (code, signal) =\u003e { if (typeof code === 'number') process.exit(code); process.kill(process.pid, signal || 'SIGTERM'); });\"\n      ],\n      \"lifecycle\": \"lazy\",\n      \"directTools\": false\n    }\n  }\n}\n",
+    "after": "{\n  \"mcpServers\": {\n    \"codegraph\": {\n      \"args\": [\n        \"serve\",\n        \"--mcp\"\n      ],\n      \"command\": \"codegraph\"\n    },\n    \"context7\": {\n      \"args\": [\n        \"-y\",\n        \"--package=@upstash/context7-mcp@2.2.5\",\n        \"--\",\n        \"context7-mcp\"\n      ],\n      \"command\": \"npx\"\n    },\n    \"engram\": {\n      \"args\": [\n        \"-e\",\n        \"const { spawn } = require('node:child_process'); const bin = process.env.ENGRAM_BIN || 'engram'; const child = spawn(bin, ['mcp', '--tools=agent'], { stdio: 'inherit' }); child.on('error', () =\\u003e process.exit(127)); child.on('exit', (code, signal) =\\u003e { if (typeof code === 'number') process.exit(code); process.kill(process.pid, signal || 'SIGTERM'); });\"\n      ],\n      \"command\": \"node\",\n      \"directTools\": false,\n      \"lifecycle\": \"lazy\"\n    }\n  }\n}\n",
+    "afterHash": "b6dcc425cd883bcece976e96f9fe710f0de8c49542f82f3da7d3acbf211e3183",
+    "overlay": false,
+    "mode": 420
+  },
+  "children": {}
+}

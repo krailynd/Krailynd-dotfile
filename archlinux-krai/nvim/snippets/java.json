@@ -1,0 +1,191 @@
+{
+  "sout": {
+    "prefix": "sout",
+    "body": ["System.out.println($0);"],
+    "description": "IntelliJ sout — print line (alias of sysout)"
+  },
+  "soutv": {
+    "prefix": "soutv",
+    "body": ["System.out.println(\"${1:var} = \" + ${1:var});"],
+    "description": "IntelliJ soutv — print variable name and value"
+  },
+  "soutm": {
+    "prefix": "soutm",
+    "body": ["System.out.println(\"${TM_FILENAME_BASE}.${1:method}\");"],
+    "description": "IntelliJ soutm — print class and method name"
+  },
+  "soutp": {
+    "prefix": "soutp",
+    "body": ["System.out.println(\"${1:param} = \" + ${1:param}); // TODO: add all params"],
+    "description": "IntelliJ soutp — print method parameter"
+  },
+  "serr": {
+    "prefix": "serr",
+    "body": ["System.err.println($0);"],
+    "description": "IntelliJ serr — print to stderr (alias of syserr)"
+  },
+  "psvm": {
+    "prefix": "psvm",
+    "body": ["public static void main(String[] args) {", "\t$0", "}"],
+    "description": "IntelliJ psvm — public static void main"
+  },
+  "psfs": {
+    "prefix": "psfs",
+    "body": ["public static final String ${1:CONST} = \"${2:value}\";"],
+    "description": "IntelliJ psfs — public static final String"
+  },
+  "psfi": {
+    "prefix": "psfi",
+    "body": ["public static final int ${1:CONST} = ${2:0};"],
+    "description": "IntelliJ psfi — public static final int"
+  },
+  "psf": {
+    "prefix": "psf",
+    "body": ["private static final ${1:String} ${2:CONST} = \"${3:value}\";"],
+    "description": "IntelliJ psf — private static final"
+  },
+  "St": {
+    "prefix": "St",
+    "body": ["String ${1:name} = \"${2:value}\";"],
+    "description": "IntelliJ St — String declaration"
+  },
+  "ifn": {
+    "prefix": "ifn",
+    "body": ["if (${1:var} == null) {", "\t$0", "}"],
+    "description": "IntelliJ ifn — if null"
+  },
+  "inn": {
+    "prefix": "inn",
+    "body": ["if (${1:var} != null) {", "\t$0", "}"],
+    "description": "IntelliJ inn — if not null"
+  },
+  "inst": {
+    "prefix": "inst",
+    "body": [
+      "if (${1:obj} instanceof ${2:Type} ${3:var}) {",
+      "\t$0",
+      "}"
+    ],
+    "description": "IntelliJ inst — instanceof with pattern variable (Java 16+)"
+  },
+  "thr": {
+    "prefix": "thr",
+    "body": ["throw new ${1:Exception}(${2:msg});"],
+    "description": "IntelliJ thr — throw new"
+  },
+  "ths": {
+    "prefix": "ths",
+    "body": ["throws ${1:Exception}"],
+    "description": "IntelliJ ths — throws declaration"
+  },
+  "lazy": {
+    "prefix": "lazy",
+    "body": [
+      "private static ${1:Type} ${2:instance};",
+      "",
+      "public static ${1:Type} get${1:Type}() {",
+      "\tif (${2:instance} == null) {",
+      "\t\t${2:instance} = new ${1:Type}();",
+      "\t}",
+      "\treturn ${2:instance};",
+      "}"
+    ],
+    "description": "IntelliJ lazy — lazy initialization singleton"
+  },
+  "iter": {
+    "prefix": "iter",
+    "body": ["for (${1:String} ${2:item} : ${3:collection}) {", "\t$0", "}"],
+    "description": "IntelliJ iter — foreach loop (alias different from foreach)"
+  },
+  "itli": {
+    "prefix": "itli",
+    "body": [
+      "for (int ${1:i} = 0; ${1:i} < ${2:list}.size(); ${1:i}++) {",
+      "\t${3:${2:list}.get(${1:i})}$0",
+      "}"
+    ],
+    "description": "IntelliJ itli — iterate List with index"
+  },
+  "itco": {
+    "prefix": "itco",
+    "body": [
+      "for (java.util.Iterator<${1:Type}> ${2:it} = ${3:collection}.iterator(); ${2:it}.hasNext(); ) {",
+      "\t${1:Type} ${4:element} = ${2:it}.next();",
+      "\t$0",
+      "}"
+    ],
+    "description": "IntelliJ itco — iterate with Iterator over Collection"
+  },
+  "ittok": {
+    "prefix": "ittok",
+    "body": [
+      "for (java.util.StringTokenizer ${1:st} = new java.util.StringTokenizer(${2:str}); ${1:st}.hasMoreTokens(); ) {",
+      "\tString ${3:token} = ${1:st}.nextToken();",
+      "\t$0",
+      "}"
+    ],
+    "description": "IntelliJ ittok — iterate StringTokenizer"
+  },
+  "itar": {
+    "prefix": "itar",
+    "body": [
+      "for (int ${1:i} = 0; ${1:i} < ${2:array}.length; ${1:i}++) {",
+      "\t${3:Type} ${4:element} = ${2:array}[${1:i}];",
+      "\t$0",
+      "}"
+    ],
+    "description": "IntelliJ itar — iterate array with index"
+  },
+  "forr": {
+    "prefix": "forr",
+    "body": [
+      "for (int ${1:i} = ${2:array}.length - 1; ${1:i} >= 0; ${1:i}--) {",
+      "\t$0",
+      "}"
+    ],
+    "description": "IntelliJ forr — reverse for loop"
+  },
+  "lst": {
+    "prefix": "lst",
+    "body": ["java.util.List<${1:String}> ${2:list} = new java.util.ArrayList<>();"],
+    "description": "IntelliJ lst — create ArrayList"
+  },
+  "psfs_field": {
+    "prefix": "psfs2",
+    "body": ["public static final ${1:String} ${2:CONST} = \"${3:value}\";"],
+    "description": "Alias psfs2 for public static final String (alternative)"
+  },
+  "prsf": {
+    "prefix": "prsf",
+    "body": ["private static final ${1:String} ${2:CONST} = \"${3:value}\";"],
+    "description": "IntelliJ prsf — private static final String"
+  },
+  "toar": {
+    "prefix": "toar",
+    "body": ["${1:collection}.toArray(new ${2:Type}[${1:collection}.size()]);"],
+    "description": "IntelliJ toar — collection to array"
+  },
+  "opt": {
+    "prefix": "opt",
+    "body": ["java.util.Optional<${1:String}> ${2:opt} = java.util.Optional.ofNullable(${3:var});"],
+    "description": "IntelliJ opt — Optional wrapper"
+  },
+  "geti": {
+    "prefix": "geti",
+    "body": [
+      "public ${1:String} get${2:Name}() {",
+      "\treturn ${3:value};",
+      "}"
+    ],
+    "description": "IntelliJ geti — getter"
+  },
+  "seti": {
+    "prefix": "seti",
+    "body": [
+      "public void set${1:Name}(${2:String} ${3:value}) {",
+      "\tthis.${3:value} = ${3:value};",
+      "}"
+    ],
+    "description": "IntelliJ seti — setter"
+  }
+}

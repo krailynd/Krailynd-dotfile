@@ -1,0 +1,7 @@
+github.com:
+    users:
+        krailynd:
+            oauth_token: YOUR_GITHUB_TOKEN
+    git_protocol: https
+    oauth_token: YOUR_GITHUB_TOKEN
+    user: krailynd
